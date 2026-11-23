@@ -1,0 +1,13 @@
+[package]
+name = "ws-reference"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
+serde_json = "=1.0.145"
+libc = "=0.2.177"
+
+[[test]]
+name = "phase0"
+path = "../../../tests/ws/phase0.rs"

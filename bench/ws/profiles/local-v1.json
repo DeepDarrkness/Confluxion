@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "name": "local-v1",
+  "pins": {
+    "bend_version": "2.0.40",
+    "bend_commit": "624dd9f4607cd29b0871a9b96d413bfb11e92f52",
+    "bend_archive_sha256": "c9ff8d67bd903fb6ad9a26b43d8a62c01021de82a44d55ce4a3dcd4732113d6b",
+    "uWebSockets": "05e6c8b55b4d28293cf23570f0f61318f8600560",
+    "uSockets": "166a04810c9fa970fc22096a7b35b792378364fb"
+  },
+  "drain_s": 2,
+  "startup_timeout_s": 5,
+  "close_timeout_s": 1
+}
