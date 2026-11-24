@@ -7,6 +7,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/protocol.rs");
+    println!("cargo:rerun-if-changed=src/worker.rs");
+    println!("cargo:rerun-if-changed=src/socket.rs");
+    println!("cargo:rerun-if-changed=abi.h");
     let output = env::var("OUT_DIR").unwrap();
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

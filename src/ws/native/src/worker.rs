@@ -93,6 +93,12 @@ pub struct Snapshot {
     pub tx_admitted: u64,
     pub tx_messages: u64,
     pub rx_messages: u64,
+    pub rx_consumed: u64,
+    pub tx_failed: u64,
+    pub rx_discarded: u64,
+    pub tx_completed_ns: u64,
+    pub rx_completed_ns: u64,
+    pub worker_tid: i32,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
     pub tx_queue_bytes: usize,
@@ -109,6 +115,8 @@ pub struct Snapshot {
     pub native_memory_idle: usize,
     pub allocation_invalid: bool,
     pub worker_stack_bytes: usize,
+    pub socket_send_buffer: u32,
+    pub socket_receive_buffer: u32,
     pub turns: u64,
     pub service_gap_peak: Duration,
     pub read_service_gap_peak: Duration,
@@ -196,11 +204,14 @@ struct State {
     rx: Option<Ring>,
     snapshot: Snapshot,
     startup_error: Option<Error>,
+    parked: bool,
 }
 struct Core {
     state: Mutex<State>,
     changed: Condvar,
     wake: Mutex<Option<OwnedFd>>,
+    ready: OwnedFd,
+    done: OwnedFd,
     join: Mutex<Option<JoinHandle<()>>>,
     config: Config,
     fixed_bytes: usize,
@@ -211,6 +222,32 @@ pub struct Client {
 
 impl Client {
     pub fn connect(
+        addr: SocketAddrV4,
+        target: &str,
+        subprotocol: Option<&str>,
+        config: Config,
+    ) -> Result<Self, Error> {
+        let client = Self::begin_connect(addr, target, subprotocol, config)?;
+        let mut s = crate::lock(&client.core.state);
+        while matches!(s.lifecycle, Lifecycle::Starting) {
+            s = client
+                .core
+                .changed
+                .wait(s)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+        if !s.snapshot.connected {
+            let e = s
+                .startup_error
+                .unwrap_or(Error::Terminal(Terminal::Protocol));
+            drop(s);
+            client.close();
+            return Err(e);
+        }
+        drop(s);
+        Ok(client)
+    }
+    pub(crate) fn begin_connect(
         addr: SocketAddrV4,
         target: &str,
         subprotocol: Option<&str>,
@@ -242,8 +279,25 @@ impl Client {
             return Err(io::Error::last_os_error().into());
         }
         let wake = unsafe { OwnedFd::from_raw_fd(fd) };
+        if crate::socket::fixture_fault(31) {
+            return Err(Error::Io(io::ErrorKind::Other));
+        }
+        let ready = eventfd()?;
+        if crate::socket::fixture_fault(32) {
+            return Err(Error::Io(io::ErrorKind::Other));
+        }
+        let done = eventfd()?;
+        if crate::socket::fixture_fault(33) {
+            return Err(Error::Io(io::ErrorKind::Other));
+        }
         let tx = Ring::new(&config);
+        if crate::socket::fixture_fault(34) {
+            return Err(Error::Io(io::ErrorKind::Other));
+        }
         let rx = Ring::new(&config);
+        if crate::socket::fixture_fault(35) {
+            return Err(Error::Io(io::ErrorKind::Other));
+        }
         let target = target.to_owned();
         let subprotocol = subprotocol.map(str::to_owned);
         let startup_bytes = target.capacity() + subprotocol.as_ref().map_or(0, String::capacity);
@@ -265,9 +319,12 @@ impl Client {
                     ..Snapshot::default()
                 },
                 startup_error: None,
+                parked: false,
             }),
             changed: Condvar::new(),
             wake: Mutex::new(Some(wake)),
+            ready,
+            done,
             join: Mutex::new(None),
             config,
             fixed_bytes,
@@ -276,6 +333,8 @@ impl Client {
         let h = thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(move || {
+                crate::lock(&worker.state).snapshot.worker_tid =
+                    unsafe { libc::syscall(libc::SYS_gettid) as i32 };
                 crate::allocation_scope_start();
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
                     run(&worker, addr, &target, subprotocol.as_deref())
@@ -299,32 +358,201 @@ impl Client {
                 s.snapshot.allocation_invalid |= memory.invalid;
                 if let Some(e) = error {
                     s.startup_error = Some(e);
-                    s.snapshot.terminal.get_or_insert(reason(e));
+                    s.snapshot.terminal = Some(reason(e));
                 }
                 s.snapshot.finished = true;
                 s.lifecycle = Lifecycle::Finished;
                 worker.changed.notify_all();
+                signal(&worker.ready);
+                signal(&worker.done);
             })?;
         *crate::lock(&core.join) = Some(h);
-        let client = Self { core };
-        let mut s = crate::lock(&client.core.state);
-        while matches!(s.lifecycle, Lifecycle::Starting) {
-            s = client
-                .core
-                .changed
-                .wait(s)
-                .unwrap_or_else(|p| p.into_inner());
-        }
-        if !s.snapshot.connected {
-            let e = s
+        Ok(Self { core })
+    }
+    pub(crate) fn startup(&self) -> Result<bool, Error> {
+        let s = crate::lock(&self.core.state);
+        if s.snapshot.connected {
+            Ok(true)
+        } else if matches!(s.lifecycle, Lifecycle::Starting) {
+            Ok(false)
+        } else {
+            Err(s
                 .startup_error
-                .unwrap_or(Error::Terminal(Terminal::Protocol));
-            drop(s);
-            client.close();
-            return Err(e);
+                .unwrap_or(Error::Terminal(Terminal::LocalClose)))
+        }
+    }
+    pub(crate) fn ready_fd(&self) -> i32 {
+        self.core.ready.as_raw_fd()
+    }
+    pub(crate) fn done_fd(&self) -> i32 {
+        self.core.done.as_raw_fd()
+    }
+    pub(crate) fn wait_begin(&self) -> Result<bool, Error> {
+        let mut s = crate::lock(&self.core.state);
+        if s.parked {
+            return Err(Error::Input);
+        }
+        if s.rx.as_ref().is_some_and(|q| q.len != 0) || !matches!(s.lifecycle, Lifecycle::Open) {
+            return Ok(false);
+        }
+        let mut value = 0u64;
+        unsafe {
+            libc::read(self.ready_fd(), &mut value as *mut _ as *mut _, 8);
+        }
+        s.parked = true;
+        Ok(true)
+    }
+    pub(crate) fn wait_end(&self) {
+        crate::lock(&self.core.state).parked = false;
+    }
+    pub(crate) fn parked(&self) -> bool {
+        crate::lock(&self.core.state).parked
+    }
+    pub(crate) fn offer_batch(&self, messages: &[(Kind, &[u8])]) -> Result<Admission, Error> {
+        if messages
+            .iter()
+            .any(|(_, b)| b.len() > self.core.config.max_frame.min(self.core.config.max_message))
+        {
+            return Ok(Admission::Rejected(Rejection::Oversize));
+        }
+        let total = messages
+            .iter()
+            .try_fold(0usize, |n, (_, b)| n.checked_add(b.len()))
+            .ok_or(Error::Input)?;
+        let mut s = crate::lock(&self.core.state);
+        if !matches!(s.lifecycle, Lifecycle::Open) {
+            return Ok(Admission::Rejected(Rejection::Closing));
+        }
+        if messages.is_empty() {
+            return Ok(Admission::Accepted);
+        }
+        if crate::socket::fixture_fault(1) {
+            panic!("injected pre-commit admission panic");
+        }
+        let q = s.tx.as_mut().unwrap();
+        if messages.len() > q.descriptors.len() - q.len || total > q.bytes.len() - q.byte_len {
+            return Ok(Admission::Rejected(Rejection::Busy));
+        }
+        let old = (q.byte_len, q.len);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            for &(kind, bytes) in messages {
+                q.push(kind, bytes);
+            }
+        }));
+        if let Err(payload) = outcome {
+            (q.byte_len, q.len) = old;
+            drop(payload);
+            return Err(Error::Terminal(Terminal::Panic));
+        }
+        s.snapshot.tx_admitted += messages.len() as u64;
+        queues(&mut s);
+        let post_commit = catch_unwind(AssertUnwindSafe(|| {
+            if crate::socket::fixture_fault(2) {
+                panic!("injected post-commit admission panic");
+            }
+        }));
+        if let Err(payload) = post_commit {
+            drop(payload);
+            s.lifecycle = Lifecycle::Closing(Instant::now());
+            s.snapshot.terminal = Some(Terminal::Panic);
+            signal(&self.core.ready);
         }
         drop(s);
-        Ok(client)
+        wake(&self.core);
+        Ok(Admission::Accepted)
+    }
+    pub(crate) fn receive_batch<F>(
+        &self,
+        count: usize,
+        bytes: usize,
+        reserve: F,
+    ) -> Result<Option<(Box<[u8]>, Box<[crate::socket::Span]>)>, u32>
+    where
+        F: FnOnce(usize) -> bool,
+    {
+        let mut s = crate::lock(&self.core.state);
+        let Some(q) = s.rx.as_mut().filter(|q| q.len != 0) else {
+            return if s.snapshot.finished || matches!(s.lifecycle, Lifecycle::Closing(_)) {
+                Err(crate::END)
+            } else {
+                Ok(None)
+            };
+        };
+        if q.descriptors[q.head].len > bytes {
+            return Err(crate::socket::HEAD_TOO_LARGE);
+        }
+        let mut n = 0;
+        let mut size = 0;
+        while n < count.min(q.len) {
+            let d = q.descriptors[(q.head + n) % q.descriptors.len()];
+            if d.len > bytes - size {
+                break;
+            }
+            size += d.len;
+            n += 1;
+        }
+        if !reserve(size) {
+            return Err(crate::FULL);
+        }
+        let mut data = vec![0; size].into_boxed_slice();
+        let mut spans = vec![crate::socket::Span::default(); n].into_boxed_slice();
+        let mut offset = 0;
+        let mut byte_head = q.byte_head;
+        for (i, span) in spans.iter_mut().enumerate() {
+            let d = q.descriptors[(q.head + i) % q.descriptors.len()];
+            let first = d.len.min(q.bytes.len() - byte_head);
+            data[offset..offset + first].copy_from_slice(&q.bytes[byte_head..byte_head + first]);
+            data[offset + first..offset + d.len].copy_from_slice(&q.bytes[..d.len - first]);
+            *span = crate::socket::Span {
+                kind: if d.kind == Kind::Binary { 0 } else { 1 },
+                offset: offset as u32,
+                len: d.len as u32,
+                reserved: 0,
+            };
+            offset += d.len;
+            byte_head = (byte_head + d.len) % q.bytes.len();
+        }
+        for _ in 0..n {
+            q.pop();
+        }
+        s.snapshot.rx_consumed += n as u64;
+        queues(&mut s);
+        drop(s);
+        wake(&self.core);
+        Ok(Some((data, spans)))
+    }
+    pub(crate) fn finish_close(&self) -> bool {
+        let mut join = crate::lock(&self.core.join);
+        if join.as_ref().is_some_and(|h| !h.is_finished()) {
+            return false;
+        }
+        if let Some(h) = join.take() {
+            let _ = h.join();
+        }
+        crate::lock(&self.core.wake).take();
+        let mut s = crate::lock(&self.core.state);
+        if crate::task_exists(s.snapshot.worker_tid) {
+            return false;
+        }
+        s.snapshot.joined = true;
+        s.snapshot.tx_failed = s.snapshot.tx_admitted - s.snapshot.tx_messages;
+        if let Some(q) = s.tx.take() {
+            s.snapshot.native_memory_live -= q.allocated_bytes();
+        }
+        if s.rx.as_ref().is_some_and(|q| q.len == 0) {
+            let q = s.rx.take().unwrap();
+            s.snapshot.native_memory_live -= q.allocated_bytes();
+        }
+        queues(&mut s);
+        true
+    }
+    pub(crate) fn discard_received(&self) {
+        let mut s = crate::lock(&self.core.state);
+        if let Some(q) = s.rx.take() {
+            s.snapshot.rx_discarded += q.len as u64;
+            s.snapshot.native_memory_live -= q.allocated_bytes();
+        }
+        queues(&mut s);
     }
     pub fn offer(&self, data: Outbound<'_>) -> Result<Admission, Error> {
         let (kind, bytes) = match data {
@@ -355,6 +583,7 @@ impl Client {
             let mut bytes = vec![0; q.descriptors[q.head].len];
             let d = q.front(&mut bytes);
             q.pop();
+            s.snapshot.rx_consumed += 1;
             if s.snapshot.joined && s.rx.as_ref().is_some_and(|q| q.len == 0) {
                 let q = s.rx.take().unwrap();
                 s.snapshot.native_memory_live -= q.allocated_bytes();
@@ -384,7 +613,9 @@ impl Client {
         let mut s = crate::lock(&self.core.state);
         if matches!(s.lifecycle, Lifecycle::Starting | Lifecycle::Open) {
             s.lifecycle = Lifecycle::Closing(Instant::now());
+            s.snapshot.terminal.get_or_insert(Terminal::LocalClose);
         }
+        signal(&self.core.ready);
         drop(s);
         wake(&self.core);
     }
@@ -442,6 +673,38 @@ fn queues(s: &mut State) {
     p.rx_queue_bytes_peak = p.rx_queue_bytes_peak.max(p.rx_queue_bytes);
     p.tx_queue_descriptors_peak = p.tx_queue_descriptors_peak.max(p.tx_queue_descriptors);
     p.rx_queue_descriptors_peak = p.rx_queue_descriptors_peak.max(p.rx_queue_descriptors);
+}
+fn eventfd() -> Result<OwnedFd, Error> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        Err(io::Error::last_os_error().into())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+fn signal(fd: &OwnedFd) {
+    let n = 1u64;
+    loop {
+        let rc = unsafe { libc::write(fd.as_raw_fd(), &n as *const _ as *const _, 8) };
+        if rc >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
+    }
+}
+pub(crate) fn monotonic_ns() -> u64 {
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) },
+        0
+    );
+    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+fn tx_complete(s: &mut State) {
+    s.snapshot.tx_messages += 1;
+    s.snapshot.tx_completed_ns = monotonic_ns();
 }
 fn reason(e: Error) -> Terminal {
     match e {
@@ -573,6 +836,27 @@ fn closing(c: &Core) -> Option<Instant> {
 fn run(c: &Core, addr: SocketAddrV4, target: &str, subprotocol: Option<&str>) -> Result<(), Error> {
     let socket = tcp(c, addr)?;
     let fd = socket.as_raw_fd();
+    let mut buffers = [0i32; 2];
+    for (value, option) in buffers.iter_mut().zip([libc::SO_SNDBUF, libc::SO_RCVBUF]) {
+        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                value as *mut _ as *mut _,
+                &mut len,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    {
+        let mut s = crate::lock(&c.state);
+        s.snapshot.socket_send_buffer = buffers[0] as u32;
+        s.snapshot.socket_receive_buffer = buffers[1] as u32;
+    }
     let authority = addr.to_string();
     let limits = protocol::Limits::new(c.config.max_frame, c.config.max_message)?;
     let mut upgrade = protocol::Upgrade::start(socket, &authority, target, subprotocol, limits)?;
@@ -603,6 +887,7 @@ fn run(c: &Core, addr: SocketAddrV4, target: &str, subprotocol: Option<&str>) ->
         }
         s.snapshot.connected = true;
         c.changed.notify_all();
+        signal(&c.ready);
     }
     let mut pending_message = false;
     let mut needs_flush = false;
@@ -612,6 +897,9 @@ fn run(c: &Core, addr: SocketAddrV4, target: &str, subprotocol: Option<&str>) ->
     let mut write_at = previous;
     let mut control_at: Option<Instant> = None;
     loop {
+        if crate::socket::fixture_fault(3) {
+            panic!("injected socket worker panic");
+        }
         protocol.begin_turn();
         let now = Instant::now();
         if close.is_none() {
@@ -676,7 +964,7 @@ fn run(c: &Core, addr: SocketAddrV4, target: &str, subprotocol: Option<&str>) ->
             needs_flush = false;
             let mut s = crate::lock(&c.state);
             if pending_message {
-                s.snapshot.tx_messages += 1;
+                tx_complete(&mut s);
                 pending_message = false;
             }
             if let Some(at) = control_at.take() {
@@ -717,7 +1005,7 @@ fn run(c: &Core, addr: SocketAddrV4, target: &str, subprotocol: Option<&str>) ->
                     FlushStep::Drained => {
                         needs_flush = false;
                         pending_message = false;
-                        crate::lock(&c.state).snapshot.tx_messages += 1;
+                        tx_complete(&mut crate::lock(&c.state));
                     }
                 }
             }
@@ -758,6 +1046,8 @@ fn run(c: &Core, addr: SocketAddrV4, target: &str, subprotocol: Option<&str>) ->
                         let mut s = crate::lock(&c.state);
                         s.rx.as_mut().unwrap().push(Kind::Binary, bytes);
                         s.snapshot.rx_messages += 1;
+                        s.snapshot.rx_completed_ns = monotonic_ns();
+                        signal(&c.ready);
                         queues(&mut s);
                         work = true;
                     }
@@ -765,6 +1055,8 @@ fn run(c: &Core, addr: SocketAddrV4, target: &str, subprotocol: Option<&str>) ->
                         let mut s = crate::lock(&c.state);
                         s.rx.as_mut().unwrap().push(Kind::Text, text.as_bytes());
                         s.snapshot.rx_messages += 1;
+                        s.snapshot.rx_completed_ns = monotonic_ns();
+                        signal(&c.ready);
                         queues(&mut s);
                         work = true;
                     }
@@ -776,7 +1068,7 @@ fn run(c: &Core, addr: SocketAddrV4, target: &str, subprotocol: Option<&str>) ->
                         close.get_or_insert((Instant::now(), Terminal::PeerClose, None));
                         let mut s = crate::lock(&c.state);
                         s.lifecycle = Lifecycle::Closing(Instant::now());
-                        s.snapshot.terminal = Some(Terminal::PeerClose);
+                        s.snapshot.terminal.get_or_insert(Terminal::PeerClose);
                         control_at.get_or_insert(Instant::now());
                         break;
                     }
@@ -803,7 +1095,7 @@ fn run(c: &Core, addr: SocketAddrV4, target: &str, subprotocol: Option<&str>) ->
                 Ok(FlushStep::Drained) => {
                     needs_flush = false;
                     if pending_message {
-                        crate::lock(&c.state).snapshot.tx_messages += 1;
+                        tx_complete(&mut crate::lock(&c.state));
                         pending_message = false;
                     }
                     if let Some(at) = control_at.take() {

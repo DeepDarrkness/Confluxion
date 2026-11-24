@@ -1,6 +1,6 @@
 import Base
-import ../../src/ws/main.bend as WS
-import ../../src/ws/effects/native.bend as Native
+import ./loopback.bend as WS
+import ./loopback-native.bend as Native
 
 def check(actual: U32, expected: U32, tag: U32) -> IO(Unit):
   import "./phase1_probe.c"

@@ -1,4 +1,5 @@
 pub mod protocol;
+mod socket;
 pub mod worker;
 
 use std::{
@@ -98,7 +99,7 @@ struct AllocationClass {
     live: AtomicU64,
     peak: AtomicU64,
 }
-static LAYOUTS: [AllocationClass; 16] = [const {
+static LAYOUTS: [AllocationClass; 512] = [const {
     AllocationClass {
         key: AtomicU64::new(0),
         allocated: AtomicU64::new(0),
@@ -106,7 +107,7 @@ static LAYOUTS: [AllocationClass; 16] = [const {
         live: AtomicU64::new(0),
         peak: AtomicU64::new(0),
     }
-}; 16];
+}; 512];
 static LAYOUT_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 fn allocation_event(l: Layout, allocate: bool) {
     let key = (l.align() as u64) << 32 | l.size() as u64;
