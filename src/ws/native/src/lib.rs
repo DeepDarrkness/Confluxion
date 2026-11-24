@@ -1,4 +1,5 @@
 pub mod protocol;
+pub mod worker;
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},

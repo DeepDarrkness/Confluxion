@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::time::Instant;
 use tungstenite::{
     client::IntoClientRequest,
     handshake::{client::ClientHandshake, HandshakeError, MidHandshake},
@@ -62,6 +63,7 @@ pub struct Protocol<S> {
     pending: bool,
     terminal: bool,
     closing: bool,
+    failure_code: u16,
 }
 pub enum Outbound<'a> {
     Binary(&'a [u8]),
@@ -95,6 +97,9 @@ pub enum ReadStep<'a> {
 }
 
 impl<S: Read + Write> Upgrade<S> {
+    pub(crate) fn wants_write(&self) -> bool {
+        self.mid.get_ref().get_ref().want_write
+    }
     pub fn start(
         io: S,
         authority: &str,
@@ -191,6 +196,7 @@ impl<S: Read + Write> Upgrade<S> {
                     pending: false,
                     terminal: false,
                     closing: false,
+                    failure_code: 1002,
                 }))
             }
         }
@@ -210,6 +216,28 @@ fn map_error(e: tungstenite::Error) -> Error {
     }
 }
 impl<S: Read + Write> Protocol<S> {
+    pub(crate) fn failure_code(&self) -> u16 {
+        self.failure_code
+    }
+    pub(crate) fn begin_turn(&mut self) {
+        let io = self.socket.get_mut();
+        io.read_left = 65536;
+        io.write_left = 65536;
+    }
+    pub(crate) fn progress(&self) -> Progress {
+        let io = self.socket.get_ref();
+        Progress {
+            rx_bytes: io.rx_bytes,
+            tx_bytes: io.tx_bytes,
+            incoming: io.guard.deadline(),
+            outgoing: io.outgoing.deadline(),
+        }
+    }
+    pub(crate) fn failure_close(&mut self, code: u16) -> Result<FlushStep, Error> {
+        // RFC 6455 requires a Close on fatal framing errors while TCP remains writable.
+        self.terminal = false;
+        self.close(Some((code, "")))
+    }
     pub fn offer(&mut self, data: Outbound<'_>) -> Result<Admission, Error> {
         if self.terminal {
             return Err(Error::Terminal);
@@ -243,6 +271,7 @@ impl<S: Read + Write> Protocol<S> {
             }
         }
         self.pending = true;
+        self.socket.get_mut().outgoing.arm();
         Ok(Admission::Accepted)
     }
     pub fn flush(&mut self) -> Result<FlushStep, Error> {
@@ -254,7 +283,8 @@ impl<S: Read + Write> Protocol<S> {
             match self.socket.flush() {
                 Ok(()) => {}
                 Err(tungstenite::Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(FlushStep::Pending)
+                    self.socket.get_mut().outgoing.arm();
+                    return Ok(FlushStep::Pending);
                 }
                 Err(e) => {
                     self.terminal = true;
@@ -263,6 +293,7 @@ impl<S: Read + Write> Protocol<S> {
             }
         }
         self.pending = false;
+        self.socket.get_mut().outgoing.waiting = None;
         Ok(FlushStep::Drained)
     }
     pub fn read(&mut self) -> Result<ReadStep<'_>, Error> {
@@ -281,6 +312,12 @@ impl<S: Read + Write> Protocol<S> {
                 return Ok(ReadStep::Closed);
             }
             Err(e) => {
+                self.failure_code = match &e {
+                    tungstenite::Error::Utf8(_) => 1007,
+                    tungstenite::Error::Capacity(_) => 1009,
+                    tungstenite::Error::Io(_) if self.socket.get_ref().guard.utf8_failed => 1007,
+                    _ => 1002,
+                };
                 self.terminal = true;
                 return Err(map_error(e));
             }
@@ -336,25 +373,126 @@ struct HeaderGuard {
     used: usize,
     need: usize,
     remaining: u64,
+    last: Option<Instant>,
+    fragmented: Option<Instant>,
+    waiting: Option<Instant>,
+    data: bool,
+    final_frame: bool,
+    validate_text: bool,
+    utf8: Option<Utf8Guard>,
+    utf8_failed: bool,
+}
+#[derive(Default)]
+struct Utf8Guard {
+    remaining: u8,
+    min: u8,
+    max: u8,
+}
+impl Utf8Guard {
+    fn inspect(&mut self, bytes: &[u8]) -> bool {
+        for &b in bytes {
+            if self.remaining != 0 {
+                if b < self.min || b > self.max {
+                    return false;
+                }
+                self.remaining -= 1;
+                self.min = 0x80;
+                self.max = 0xbf;
+            } else {
+                let (remaining, min, max) = match b {
+                    0..=0x7f => continue,
+                    0xc2..=0xdf => (1, 0x80, 0xbf),
+                    0xe0 => (2, 0xa0, 0xbf),
+                    0xe1..=0xec | 0xee..=0xef => (2, 0x80, 0xbf),
+                    0xed => (2, 0x80, 0x9f),
+                    0xf0 => (3, 0x90, 0xbf),
+                    0xf1..=0xf3 => (3, 0x80, 0xbf),
+                    0xf4 => (3, 0x80, 0x8f),
+                    _ => return false,
+                };
+                self.remaining = remaining;
+                self.min = min;
+                self.max = max;
+            }
+        }
+        true
+    }
+}
+pub(crate) struct Progress {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub incoming: Option<Instant>,
+    pub outgoing: Option<Instant>,
 }
 impl HeaderGuard {
-    fn new() -> Self {
+    fn new(validate_text: bool) -> Self {
         Self {
             header: [0; 14],
             used: 0,
             need: 2,
             remaining: 0,
+            last: None,
+            fragmented: None,
+            waiting: None,
+            data: false,
+            final_frame: true,
+            validate_text,
+            utf8: None,
+            utf8_failed: false,
         }
     }
+    fn read_size(&self, max: usize) -> usize {
+        max.min(if self.remaining != 0 {
+            self.remaining.min(usize::MAX as u64) as usize
+        } else {
+            self.need - self.used
+        })
+    }
     fn inspect(&mut self, bytes: &[u8]) -> io::Result<()> {
-        for &b in bytes {
+        let now = Instant::now();
+        let mut bytes = bytes;
+        while !bytes.is_empty() {
             if self.remaining != 0 {
-                self.remaining -= 1;
+                let n = self.remaining.min(bytes.len() as u64) as usize;
+                if self.data && self.utf8.as_mut().is_some_and(|u| !u.inspect(&bytes[..n])) {
+                    self.utf8_failed = true;
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                self.remaining -= n as u64;
+                bytes = &bytes[n..];
+                self.last = Some(now);
+                if self.data && self.fragmented.is_some() {
+                    self.fragmented = Some(now);
+                }
+                if self.remaining == 0 {
+                    self.complete(now)?;
+                }
                 continue;
+            }
+            let b = bytes[0];
+            bytes = &bytes[1..];
+            if self.used == 0 {
+                self.data = b & 8 == 0;
+                self.final_frame = b & 128 != 0;
+                self.waiting = None;
+                if self.validate_text {
+                    match (b & 15, b & 0x70, self.fragmented.is_some()) {
+                        (1, 0, false) => self.utf8 = Some(Utf8Guard::default()),
+                        (0, 0, true) | (8..=10, 0, _) => (),
+                        _ => self.utf8 = None,
+                    }
+                }
+            }
+            self.last = Some(now);
+            if self.data && self.fragmented.is_some() {
+                self.fragmented = Some(now);
             }
             self.header[self.used] = b;
             self.used += 1;
             if self.used == 2 {
+                if b & 128 != 0 {
+                    self.utf8 = None;
+                }
                 self.need = match b & 127 {
                     126 => 4,
                     127 => 10,
@@ -375,9 +513,36 @@ impl HeaderGuard {
                 self.remaining = n;
                 self.used = 0;
                 self.need = 2;
+                if n == 0 {
+                    self.complete(now)?;
+                }
             }
         }
         Ok(())
+    }
+    fn complete(&mut self, now: Instant) -> io::Result<()> {
+        self.last = None;
+        if self.data {
+            self.fragmented = if self.final_frame { None } else { Some(now) };
+            if self.final_frame {
+                if self.utf8.take().is_some_and(|u| u.remaining != 0) {
+                    self.utf8_failed = true;
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+            }
+        }
+        Ok(())
+    }
+    fn arm(&mut self) {
+        if self.last.is_none() && self.waiting.is_none() {
+            self.waiting = Some(Instant::now());
+        }
+    }
+    fn deadline(&self) -> Option<Instant> {
+        [self.last, self.fragmented, self.waiting]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 struct BoundedIo<S> {
@@ -388,6 +553,12 @@ struct BoundedIo<S> {
     end: Option<usize>,
     established: bool,
     guard: HeaderGuard,
+    outgoing: HeaderGuard,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    read_left: usize,
+    write_left: usize,
+    want_write: bool,
 }
 impl<S> BoundedIo<S> {
     fn new(inner: S) -> Self {
@@ -398,17 +569,28 @@ impl<S> BoundedIo<S> {
             cursor: 0,
             end: None,
             established: false,
-            guard: HeaderGuard::new(),
+            guard: HeaderGuard::new(true),
+            outgoing: HeaderGuard::new(false),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            read_left: usize::MAX,
+            write_left: usize::MAX,
+            want_write: false,
         }
     }
 }
 impl<S: Read> Read for BoundedIo<S> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.want_write = false;
+        if self.read_left == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
         if self.end.is_none() {
             loop {
                 let old = self.filled;
                 let stage = self.stage.as_mut().unwrap();
                 let n = self.inner.read(&mut stage[old..old + READ])?;
+                self.rx_bytes += n as u64;
                 if n == 0 {
                     return Ok(0);
                 }
@@ -421,7 +603,7 @@ impl<S: Read> Read for BoundedIo<S> {
                     if end > HEADER {
                         return Err(io::ErrorKind::FileTooLarge.into());
                     }
-                    self.guard.inspect(&stage[end..self.filled])?;
+                    HeaderGuard::new(false).inspect(&stage[end..self.filled])?;
                     self.end = Some(end);
                     break;
                 }
@@ -431,16 +613,29 @@ impl<S: Read> Read for BoundedIo<S> {
             }
         }
         if self.cursor < self.filled {
-            let n = out.len().min(self.filled - self.cursor);
+            let n = if self.established {
+                self.guard
+                    .read_size(out.len().min(self.filled - self.cursor).min(self.read_left))
+            } else {
+                out.len().min(self.end.unwrap() - self.cursor)
+            };
             out[..n].copy_from_slice(&self.stage.as_ref().unwrap()[self.cursor..self.cursor + n]);
             self.cursor += n;
+            if self.established {
+                self.read_left -= n;
+                self.guard.inspect(&out[..n])?;
+            }
             if self.cursor == self.filled {
                 self.stage = None;
             }
             return Ok(n);
         }
-        let count = out.len().min(READ);
+        let count = self
+            .guard
+            .read_size(out.len().min(READ).min(self.read_left));
         let n = self.inner.read(&mut out[..count])?;
+        self.rx_bytes += n as u64;
+        self.read_left -= n;
         if self.established {
             self.guard.inspect(&out[..n])?;
         }
@@ -449,9 +644,24 @@ impl<S: Read> Read for BoundedIo<S> {
 }
 impl<S: Write> Write for BoundedIo<S> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match self.inner.write(bytes)? {
+        self.want_write = true;
+        if self.write_left == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        match self
+            .inner
+            .write(&bytes[..bytes.len().min(self.write_left)])?
+        {
             0 if !bytes.is_empty() => Err(io::ErrorKind::WriteZero.into()),
-            n => Ok(n),
+            n => {
+                self.want_write = false;
+                self.tx_bytes += n as u64;
+                self.write_left -= n;
+                if self.established {
+                    self.outgoing.inspect(&bytes[..n])?;
+                }
+                Ok(n)
+            }
         }
     }
     fn flush(&mut self) -> io::Result<()> {
