@@ -1,22 +1,23 @@
 # WebSocket phased implementation plan
 
-Build a reusable local WebSocket client library that maintains full-duplex IO during Bend computation, with bounded memory and measurable message throughput. The computation pool is an integration layer above the library. These phases establish that path before adding SpacetimeDB envelopes, BSATN, generated bindings, or durable coordinator recovery.
+Connect BendRT reliably to SpacetimeDB while keeping application logic and authoritative schema declarations in Bend. Use Rust's Tungstenite WebSocket implementation behind a bounded native worker and a Bend API. Phases 1 through 4 qualify that transport boundary; the SpacetimeDB delivery track then adds Bend sessions, BSATN, generated bindings, and transactional module shims. Throughput tuning and the computation pool remain separate qualification work. An all-Bend WebSocket implementation is deferred to optional Phase 7.
 
 Design: when changing socket ownership or computation scheduling, read the [selected worker model](bend-websocket-design.md#selected-worker-model).
 
 ## Current status
 
-Status as of November 24, 2026. Phase 0 passed its Cargo native-build and correctness qualification. The fresh run passed all nine trials and damaged-evidence checks. See [qualification results and the exact command](ws-phase0-verification.md#completed-qualification) and the [run summary](../results/ws/cargo-1795497449219896432-3075/phase-0/summary.json). The original multi-hour baseline, noise, and headroom gate was removed by user choice, not passed. Throughput qualification remains TODO for Phase 5. The status table is authoritative for phase progress.
+Status as of November 24, 2026. Phases 0 and 1 passed the Cargo suite. The fresh run passed all nine Phase 0 trials and damaged-evidence checks, then qualified real Bend effect ownership in both instrumented and sanitizer modes. See [Phase 0 qualification](ws-phase0-verification.md#completed-qualification), the [fresh Phase 0 summary](../results/ws/cargo-1795505060696688630-53818/phase-0/summary.json), and [Phase 1 qualification](ws-phase1-verification.md). The original multi-hour baseline, noise, and headroom gate was removed by user choice, not passed. Throughput qualification remains TODO for Phase 5. The status table is authoritative for phase progress.
 
 | Phase | Status | Checkable outcome | Required gate before proceeding |
 | --- | --- | --- | --- |
 | 0 | Passed | Cargo owns native builds, million-message integrity each way, four fault controls, four reference-bound trials, and damaged-evidence rejection | Cargo correctness gate passed November 24, 2026; [verification](ws-phase0-verification.md#completed-qualification), [evidence](../results/ws/cargo-1795497449219896432-3075/phase-0/summary.json) |
-| 1 | Not started | Valid native resource/effect ownership | Real Bend start, transfer, release, and shutdown cycles pass |
-| 2 | Not started | Correct incremental WebSocket protocol | Protocol vectors, fault injection, and independent decoding pass |
-| 3 | Not started | Independent full-duplex native transport | Real-peer interoperability, client conformance, and bounded-overload tests pass |
+| 1 | Passed | Valid native resource/effect ownership | 1,000 real Bend cycles per instrumentation mode, resource baseline restoration, faults, and waiting-close passed November 24, 2026; [verification](ws-phase1-verification.md), [evidence](../results/ws/cargo-1795505106060709584-53967/phase-1/summary.json) |
+| 2 | Not started | Qualified Tungstenite protocol integration | Configured limits, handshake checks, partial IO, and independent decoding pass |
+| 3 | Not started | Independent full-duplex Rust transport | Real-peer interoperability, client conformance, and bounded-overload tests pass |
 | 4 | Not started | Complete Bend message path | Bend payloads cross the effects correctly; native IO progresses during computation |
 | 5 | Not started | Useful local throughput at bounded latency | Freeze the performance profile, qualify reference noise and headroom, then pass paired reference and Bend-overhead targets |
 | 6 | Not started | Bounded reusable computation workers | Pool limits, result correlation, compute correctness, and ordering pass under load |
+| 7 | Deferred; optional | All-Bend WebSocket implementation behind the same Bend API | Revisit after reliable Rust-backed SpacetimeDB integration; qualify equivalent interoperability, independent progress, bounds, and cleanup before replacement |
 
 Set a phase to `In progress` when implementation begins, `Blocked` when its stop condition prevents progress, and `Passed` only when its gate passes. A passed phase links its verification artifacts; a blocked phase records the failing check and next action. Advance after the current gate passes.
 
@@ -24,21 +25,25 @@ Set a phase to `In progress` when implementation begins, `Blocked` when its stop
 
 Initial planning baseline on November 23, 2026: this repository contained design documents, with no WebSocket sources, build harness, or benchmark results. A local tool check found Rust/Cargo but did not find `bend` or `clang` on `PATH`. Revised Phase 0 establishes the compiler and reference correctness environment.
 
-The first implementation targets Linux, IPv4 loopback, plaintext client connections, no compression, and persistent connections. Native framing is implemented locally rather than delegated to another WebSocket library. Established libraries supply independent peers, reference behavior, and comparison measurements. Production server support requires its own conformance gate; a test peer is not a production server implementation.
+The first implementation targets Linux, IPv4 loopback, plaintext client connections, no compression, and persistent connections. Transport decision, November 24, 2026: reuse Tungstenite for handshake and framing rather than implement another protocol core. An embedded Rust static library owns an independent IO worker; a small C effect adapter connects it to BendRT. Application code does not depend on Rust or WebSocket types. The selected shape and unresolved ABI qualification are documented in the [transport-library decision](bend-websocket-design.md#transport-library-decision).
+
+The [trusted-local access policy](confluxion-arch1.md#trusted-local-access-policy) applies to the SpacetimeDB delivery track: bind to `127.0.0.1`, connect without client credentials, and generate allow-all local access. Auth checks are not a Phase 1 or initial connector requirement. Schema, bounds, version, fencing, and atomic-commit checks remain required.
+
+Tungstenite 0.28.0 is already pinned for the reference actor; Phase 1 pins the production worker's dependencies in the root Cargo lockfile. Tokio is not required for the initial dedicated-thread worker. uWebSockets remains an independent peer, and Autobahn supplies client conformance checks. Comparing two Tungstenite-based paths measures integration overhead, not independent protocol correctness. Production server support requires its own conformance gate.
 
 The smallest implementation units are organized by ownership:
 
 | Proposed location | Responsibility |
 | --- | --- |
-| `src/ws/native/protocol.*` | Incremental handshake, frames, fragmentation, masks, controls, and close state |
-| `src/ws/native/transport.*` | Descriptor ownership, readiness, deadlines, native queues, and worker lifecycle |
+| `src/ws/native/` Rust crate | Tungstenite integration, configured limits, handshake policy, socket readiness, deadlines, native queues, and worker lifecycle |
+| `src/ws/native/` private C ABI | Fixed-width status records and bounded byte transfer; Rust objects and allocations remain private |
 | `src/ws/main.bend` and `src/ws/effects/` | Affine session API, bounded admission, batched transfer, release, and close |
 | `examples/ws-worker-pool/` | Bounded job dispatch and reusable BendRT processes, outside the transport library |
 | `tests/ws/` | Protocol vectors, fault injection, lifecycle checks, and conformance adapter |
 | `bench/ws/` | Independent peers, workloads, compute fixtures, and machine profiles |
 | `Cargo.toml` and `tests/ws/phase0.rs` | Build native fixtures and run the correctness gate through Cargo's Rust test framework |
 
-Phase 0 supplies the Cargo test, reference peers, correctness profile, and artifact format. Other paths remain proposed interfaces. Verification below for phases 1 through 6 describes planned coverage, not currently executable checks. Later phases add real checks to the same Cargo test framework; the current command does not imply future phases exist or pass.
+Phase 0 supplies the Cargo test, reference peers, correctness profile, and artifact format. Phase 1 implements `src/ws/` ownership and real Bend lifecycle fixtures. Verification below for phases 2 through 7 and the SpacetimeDB delivery track describes planned coverage, not currently executable checks. Later phases add real checks to the same Cargo test framework; the current command does not imply future phases exist or pass.
 
 Each Phase 0 invocation writes `results/ws/cargo-<run-id>/phase-0/summary.json`, actor reports, the profile, native build artifacts, command lines, and trial results. Planned conformance phases also retain case-level Autobahn output. Results are evidence artifacts produced during implementation, not measurements established by this plan.
 
@@ -55,27 +60,29 @@ The user removed the original long benchmark gate to keep testing minimalist. Hi
 
 ## Phase 1. Prove native effect ownership
 
-- Outcome: Bend can safely own a persistent native worker service and exchange bounded byte payloads through the actual effect ABI.
-- Owns: minimal `src/ws/main.bend`, `src/ws/effects/`, native resource lifecycle, and lifecycle fixtures. Depends on phase 0.
-- Smallest unit: use an in-memory native queue and wake mechanism, without WebSocket framing. Validate the session capability accepted by the pinned compiler. Keep native byte storage separate from Bend terms; construct Bend values only on the runtime thread.
+- Outcome: Bend can safely own a persistent Rust worker service and exchange bounded byte payloads through the actual effect ABI.
+- Owns: minimal `src/ws/main.bend`, `src/ws/effects/`, the Rust static library and private C ABI, native resource lifecycle, and lifecycle fixtures. Depends on phase 0.
+- Smallest unit: link the Rust static library through the C effect adapter and use an in-memory native queue and wake mechanism, without WebSocket framing. Validate the session capability accepted by the pinned compiler. Keep Rust-owned byte storage separate from Bend terms; construct Bend values only on the runtime thread. Define copy, admission, and release ownership and contain Rust panics at the C boundary.
 - Verification: extend `cargo test --release --locked` with the real Bend ownership fixture, not a C-only simulation.
-- Gate: 1,000 start/transfer/release/close cycles have zero live native allocations, descriptors, or helper threads left after each cycle. Empty/full queue admission, failed startup, stale generations, repeated shutdown, and close with a waiting receiver have defined results. Native-thread joins finish within one second after close initiation in this fixture. The ownership/fault suite passes with native memory instrumentation and sanitizers where the selected compiler supports them.
+- Gate: 1,000 start/transfer/release/close cycles leave zero client-owned live native allocations, descriptors, or helper threads after each cycle and restore the measured Bend runtime baseline. Empty/full queue admission, failed startup, stale generations, repeated shutdown, and close with a waiting receiver have defined results. Native-thread joins finish within one second after close initiation in this fixture. The ownership/fault suite passes with native memory instrumentation and sanitizers where the selected compiler supports them.
 - Stop: an unusable handle representation, off-thread Bend heap access, lost wakeup, or unresolved leak blocks framing work. Revise the effect representation and rerun this same gate before building callers around it.
 
-## Phase 2. Implement the incremental protocol core
+Completed November 24, 2026. The [qualification report](ws-phase1-verification.md) records the affine Base-handle representation, fixed native storage, separate close capability, actual allocator accounting, 1,000-cycle results, fault controls, and supported sanitizer coverage. The same full Cargo invocation reran and passed Phase 0.
 
-- Outcome: correct wire messages independent of socket timing and Bend application logic.
-- Owns: `src/ws/native/protocol.*` and protocol fixtures in `tests/ws/`. Depends on phase 1's resource and buffer representation.
-- Smallest unit: implement HTTP upgrade state, frame reader/writer state, then fragmented-message and control handling. Test input bytes and exact serialized output without a real network first.
-- Verification: extend `cargo test --release --locked` with incremental protocol checks.
-- Gate: RFC accept vectors and negative upgrades pass; header splits are tested at every byte boundary; small frame fixtures are split at every boundary and larger frames use seeded random splits. Preserve a data frame coalesced with the upgrade response. Cover lengths 0, 125, 126, 65,535, and 65,536, configured limits, malformed lengths/opcodes/masks, fragmented UTF-8, Ping/Pong, and Close. Encode our frames and decode them with an independent reference, and test the reverse direction. Force one-to-seven-byte writes alternating with `WouldBlock`; the collected wire bytes must match the expected frame sequence exactly. All allocation limits are checked before allocation.
-- Stop: a missing protocol case, changed message boundary, duplicate accepted frame, or incorrect partial-write suffix blocks socket integration. Keep codec timing as a diagnostic; self-roundtrip speed is not a release gate. Tungstenite's exact-wire trickle-write tests are the implementation reference. [Frame codec][ws-tungstenite-frame]
+## Phase 2. Qualify the Rust WebSocket protocol integration
 
-## Phase 3. Implement the full-duplex native socket worker
+- Outcome: configured Tungstenite behavior preserves correct wire messages independently of Bend application logic.
+- Owns: Tungstenite configuration, handshake/subprotocol policy, IO adapter, and integration fixtures in `tests/ws/`. Depends on phase 1's resource and buffer representation.
+- Smallest unit: use the pinned Tungstenite implementation for upgrade, incremental framing, masks, fragmentation, UTF-8, controls, and close. Configure frame, message, read-buffer, and write-buffer limits. Test the actual adapter with prepared read/write sources before real networking; do not copy or fork the protocol core.
+- Verification: extend `cargo test --release --locked` with behavior-focused checks for the configured protocol adapter. Upstream tests are references, not a substitute for testing our integration.
+- Gate: RFC accept vectors and negative upgrades pass; header splits are tested at every byte boundary; small frame fixtures are split at every boundary and larger frames use seeded random splits. Preserve a data frame coalesced with the upgrade response. Cover lengths 0, 125, 126, 65,535, and 65,536, configured limits, malformed lengths/opcodes/masks, fragmented UTF-8, Ping/Pong, and Close. Decode emitted frames with an independent reference and test the reverse direction; another Tungstenite instance alone is not independent evidence. Force one-to-seven-byte writes alternating with `WouldBlock`; the collected wire bytes must match the expected frame sequence exactly. Admission bounds apply before enqueueing, configured limits reject excess data, and dependency allocations count toward the derived native memory budget.
+- Stop: a missing required integration case, changed message boundary, duplicate accepted frame, or incorrect partial-write suffix blocks socket integration. Keep codec timing as a diagnostic; self-roundtrip speed is not a release gate. The dependency retains unsent wire bytes; the adapter must not resubmit accepted messages after `WouldBlock`. [Frame codec][ws-tungstenite-frame]
+
+## Phase 3. Implement the full-duplex Rust socket worker
 
 - Outcome: a working native client interoperates with independent local peers while keeping memory and service times bounded.
-- Owns: `src/ws/native/transport.*`, native connection queues, and the conformance adapter. Depends on phases 1 and 2.
-- Smallest unit: one client connection owned by one native readiness loop, with exact write offsets, wakeups, deadlines, and bounded incoming/outgoing admission. Add multiple connections only after the single-connection gate passes. Queue-full handling remains nonblocking for the native worker.
+- Owns: the Rust worker in `src/ws/native/`, native connection queues, and the conformance adapter. Depends on phases 1 and 2.
+- Smallest unit: one nonblocking client connection owned by one Rust readiness loop, with Tungstenite retaining partial-write state. Instrument actual byte progress for independent per-direction deadlines. Drive reads, pending writes, and automatic Pong/Close flushing without blocking the opposite direction. Add multiple connections only after the single-connection gate passes. Queue-full handling remains nonblocking for the native worker.
 - Verification: extend `cargo test --release --locked` with real-peer and conformance checks. The test drives the production native client against Tungstenite and uWebSockets peers and an Autobahn fuzzing server.
 - Gate: freeze the complete non-extension client case selection in `local-v1` before implementation; missing or skipped required cases block the gate. All selected cases pass with exact case IDs recorded. Text cases are included; compression groups `12.*` and `13.*` are excluded explicitly. Group `9.*` limits/performance cases run separately with size limits and expected limit rejection recorded, and handshake-negative tests run outside Autobahn. Independent streams deliver at least one million validated messages each way, with zero unexpected loss, duplication, reordering, or corruption. Across 100 pause/fill/drain cycles, native retained memory never exceeds the derived budget and returns to its established idle allocation state. Under unsaturated service, readable/writable connections and pending controls are serviced within the profile's 10 ms test budget. A nonprogressing incoming or outgoing partial frame closes within its own configured deadline plus that service budget; unrelated traffic does not extend either deadline.
 - Stop: failed conformance, a breached memory cap, or starvation of an eligible direction blocks the Bend API. A queued control frame is not considered eligible to bypass a partially written frame or unread TCP bytes. No heartbeat guarantee is made during indefinite receive saturation. [Autobahn coverage][ws-autobahn]
@@ -106,6 +113,24 @@ The user removed the original long benchmark gate to keep testing minimalist. Hi
 - Verification: extend `cargo test --release --locked` with pool checks and rerun all preceding real gates.
 - Gate: W3 and W4 never exceed configured process, queued-job, active-job, or result-byte limits; no worker is created per request. Normal W3 capacity and latency trials require exactly one validated successful result per admitted job and zero unexpected terminal failures. Fault-injection trials require exactly one terminal outcome per admitted job, matched to its injected fault. Failed and unfinished jobs remain visible in qualification results. Job IDs correlate variable-duration and out-of-order completion, while a partitioned fixture preserves its declared ordering. At 50% of the measured fixed-pool compute capacity, job p99 is no more than the matching compute-only p99 plus 2 ms. Both trials use identical scheduled arrivals, input order, queue limits, scheduling policy, process count, and thread budgets; both measure from scheduled job arrival until the benchmark coordinator validates its result. The compute-only path bypasses the WebSocket adapter using the reference local test channel; pure computation duration is reported separately. In a mixed long/short-job test, independent worker processes make observable progress while one runs a long job. At a scheduled job rate of 70% of compute-only capacity, transport p99 stays within phase 5's 2 ms budget on eligible unsaturated traffic. Shutdown completes within the configured drain deadline plus one second and leaves no child or native worker behind.
 - Stop: arithmetic results without verified execution, unbounded spawning, duplicate dispatch, broken ordering, or CPU oversubscription blocks pool readiness. More processes need not increase throughput when one job already uses the machine's CPU/GPU capacity. Report process-count results rather than require a fabricated linear speedup.
+
+## SpacetimeDB delivery track
+
+Start after Phase 4 establishes the reliable Bend/Rust message path. Phases 5 and 6 do not block the first usable single-worker SpacetimeDB connection. A deployed computation pool still requires its own Phase 6 qualification. This track is not yet implemented.
+
+1. Generate concrete BSATN contracts, Bend bindings/codecs, and Rust module tables and reducer registrations from explicit Bend schema, export, and persistence declarations. Apply the trusted-local access policy. Compare the built module schema with those contracts; reject unsupported declarations or disagreement.
+2. Implement the Bend-owned SpacetimeDB session over complete binary messages from the Rust worker. Connect anonymously, negotiate the pinned protocol, decode connection metadata, handle the server compression prefix, correlate calls, and publish consistent subscription snapshots and complete transaction updates.
+3. Generate transactional Rust shims that validate declared commit conditions, write rows and checkpoints atomically, and record durable operation outcomes. Demonstrate one real Bend computation, reducer call, subscription update, and disconnect/reconciliation path against persistent SpacetimeDB. Verify that an anonymous reconnect with a new connection identity can reconcile the same durable operation without duplicate effects. Application developers do not hand-maintain a second Rust schema or business algorithm.
+4. Provide one build workflow for the Bend application, native Rust transport, generated WASM module, and frontend bindings. Qualify the [connector gates](bend-websocket-design.md#validation-gates-before-declaring-the-connector-usable) and [shim targets](bend-shim-design.md#verification-targets) relevant to the deployed single-worker configuration before declaring it usable; qualify pool-specific gates when adding a pool.
+
+## Phase 7. Revisit an all-Bend WebSocket implementation
+
+- Status: deferred and optional. Rust transport is the initial delivery path.
+- Outcome: a Bend implementation can replace the Rust WebSocket implementation without changing application declarations, the public Bend API, BSATN contracts, or generated SpacetimeDB shims.
+- Depends on: a reliable Rust-backed SpacetimeDB connector and measured reasons to revisit the transport. Phase 7 is not a prerequisite for that connector.
+- Smallest unit: probe the scheduling and packed-byte representation required for independent IO before implementing the protocol. A separate Bend transport process or future runtime support may be needed; current same-process Base TCP cannot progress during long pure computation.
+- Gate: qualify equivalent protocol interoperability, independent duplex progress, memory bounds, cleanup, and real SpacetimeDB behavior. Compare performance against the qualified Rust path before replacement. No replacement capability or speedup is established by this plan.
+- Stop: a shared-event-loop stall, schema change caused only by transport replacement, or failed equivalence gate keeps Rust as the production transport. See the [deferred Bend implementation constraints](bend-websocket-design.md#deferred-bend-implementation).
 
 ## Real-world local workloads
 
@@ -159,7 +184,7 @@ A correctness fixture deliberately injects faults, but a capacity trial must hav
 
 Each phase reruns preceding load-bearing correctness checks before proceeding. No phase passes from an agent's summary, a successful `send`, or a self-roundtrip alone. The verifier must read the actual peer results, resource counters, and case-level failures. Missing evidence is a failed or inconclusive gate.
 
-Phase 5 qualifies the standalone local WebSocket library. Phase 6 qualifies its bounded computation-pool example. The [connector validation gates](bend-websocket-design.md#validation-gates-before-declaring-the-connector-usable) remain necessary for later SpacetimeDB integration. A live SpacetimeDB test must eventually confirm one reducer call, one persistent subscription, atomic updates, and uncertain-commit recovery. Those checks cannot be inferred from a synthetic job peer.
+Phase 5 qualifies standalone transport performance. Phase 6 qualifies its bounded computation-pool example. The SpacetimeDB delivery track begins after Phase 4 and must independently confirm a reducer call, persistent subscription, atomic updates, and uncertain-commit recovery. Those checks cannot be inferred from a synthetic job peer. Optional Phase 7 changes only the transport implementation after the Rust-backed connector is reliable.
 
 [ws-tungstenite-frame]: https://github.com/snapview/tungstenite-rs/blob/master/src/protocol/frame/mod.rs
 [ws-tungstenite-protocol]: https://github.com/snapview/tungstenite-rs/blob/master/src/protocol/mod.rs

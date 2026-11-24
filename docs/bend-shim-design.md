@@ -12,6 +12,23 @@ Bend owns its internal domain representation. A generated boundary conversion pr
 
 This removes the typed table API's row encoding step. It does not make network transfer, module argument handling, storage conversion, or transaction commit zero-copy.
 
+## Transport-independent module generation
+
+The initial client transport is an embedded Rust/Tungstenite worker behind Bend effects. An all-Bend WebSocket implementation is deferred. Neither choice changes the generated SpacetimeDB shim's responsibility: the server host handles WebSocket messages and dispatches validated reducer arguments and caller context to the Rust WASM module. The shim does not see the WebSocket endpoint, frame masks, or the client's implementation language. [Client protocol][v2], [reducer dispatch][rust-dispatch], [host execution][reducer-execution]
+
+The native Rust transport and generated Rust module are separate build artifacts. The module does not link the transport library. Explicit Bend declarations are the schema authority for both client bindings and module registrations; developers do not hand-maintain Rust table definitions alongside Bend declarations.
+
+The generator implements the module boundary as follows:
+
+1. Validate explicit Bend persistence, export, dependency, and invariant declarations and derive their concrete BSATN contracts. Use the [trusted-local access policy](confluxion-arch1.md#trusted-local-access-policy) for the initial deployment.
+2. Emit Rust table, index, reducer, and result registrations from those contracts, alongside matching Bend codecs and bindings. Unsupported declarations fail generation rather than silently changing representation.
+3. Emit the transactional commit shim that decodes proposal metadata and descriptors, checks current database versions, inserts the declared row slices, and writes checkpoints and operation outcomes atomically. Local shims do not check caller identity, roles, or auth claims.
+4. Build the WASM module and compare its extracted schema with the generated contracts before deployment. Changes to application schema or policies regenerate both sides.
+
+The row-write contract and raw insertion implementation described below apply identically with Rust or Bend WebSockets. Replacing only the transport should require no shim rewrite. A changed reducer signature, application schema, authorization policy, or SpacetimeDB ABI can require regeneration or migration independently of transport.
+
+Application algorithms execute in native Bend outside database transactions. Generated Rust shims enforce declared invariants, freshness, and atomic persistence inside transactions, with allow-all local application access. These declarations originate in Bend, but arbitrary Bend code is not automatically executed inside a reducer. A required server-side rule needs a supported generated representation or an explicit database constraint; freshness checks alone do not validate business correctness.
+
 ## Internal Bend types and database contracts are separate
 
 Bend business code can use records, variants, dependent relationships, and local resources suited to its computation. Those values do not have to mirror the database's row types.
@@ -145,7 +162,7 @@ The shim therefore establishes all row boundaries before insertion and does not 
 
 ### Atomic validation and failures
 
-The shim checks operation identity, authorization, contract agreement, expected checkpoints, dependency versions, and fencing conditions in the same transaction as writes. Descriptor ranges need checked arithmetic, bounds, non-overlap, and complete payload coverage. Batch row counts and byte sizes remain bounded.
+The shim checks operation identity, contract agreement, expected checkpoints, dependency versions, and fencing conditions in the same transaction as writes. It performs no application authorization checks in the initial trusted-local profile. Descriptor ranges need checked arithmetic, bounds, non-overlap, and complete payload coverage. Batch row counts and byte sizes remain bounded.
 
 The insertion path checks the actual row schema, table existence, uniqueness, and sequence behavior. Raw bytes do not bypass those checks. A malformed row, failed insertion, or failed final checkpoint write must cause reducer failure rather than leave an accepted partial batch. [Insertion errors][wasm-insert], [datastore constraints][mut-insert]
 

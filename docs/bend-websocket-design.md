@@ -4,11 +4,13 @@ Research date: November 17, 2026. This document consolidates the WebSocket feasi
 
 Worker-model decision: November 23, 2026.
 
+Transport-library decision: November 24, 2026. Use Rust/Tungstenite for the initial client; defer an all-Bend WebSocket implementation to optional Phase 7.
+
 ## Verdict
 
 **The architecture is feasible, with runtime scheduling and binary-data representation as the main implementation risks.** Current Bend provides native binary TCP, timed polling, channels, and system entropy. SpacetimeDB accepts a plaintext WebSocket client that sends BSATN calls and receives replies and subscription updates on the same connection. [Bend Base][bend-base], [native TCP][bend-connect], [SpacetimeDB transport][stdb-sdk]
 
-The selected design uses an independent native worker for full-duplex socket IO, and a bounded number of computation workers rather than spawning one per request. Bounded native buffers connect transport to Bend BSATN codecs and a SpacetimeDB-specific session layer. Generated service bindings sit above those libraries. React uses the existing SpacetimeDB SDK.
+The selected design uses an independent Rust worker with Tungstenite for full-duplex socket IO, and a bounded number of computation workers rather than spawning one per request. Bounded native buffers connect transport to Bend BSATN codecs and a SpacetimeDB-specific session layer. Generated service bindings sit above those libraries. Application logic and authoritative schema declarations stay in Bend. React uses the existing SpacetimeDB SDK.
 
 The initial target places SpacetimeDB and BendRT on the same machine, using IPv4 loopback, plaintext `ws://`, one pinned SpacetimeDB subprotocol, and disabled compression. Message throughput, latency under load, and progress during Bend computation are the performance priorities. No connector code was written, no live integration was exercised, and no performance improvement was measured. The `bend` executable was not found on this workspace's `PATH` during the research.
 
@@ -24,6 +26,53 @@ Transport concurrency, concurrent jobs, and parallelism within a job have separa
 
 The native socket worker handles bytes, descriptors, and transport state. Bend's runtime thread executes Bend code and constructs Bend values. A slow writer must not stop reads, and the socket worker must not wait for computation or queue capacity.
 
+## Transport-library decision
+
+### Caller experience and ownership
+
+The application imports a generated Bend binding, receives typed subscription inputs, computes a proposal in Bend, and submits it through the binding. Rust implements transport mechanics. A WebSocket library supplies framing and connection IO, not SpacetimeDB schema generation, subscription-cache semantics, or durable commit recovery.
+
+Conceptual usage and signatures below are not implemented APIs or checked Bend syntax:
+
+```text
+session = Binding.start(config, limits)
+(session, inputs) = Binding.ready(session)
+proposal = application_transition(inputs.values)
+(session, admission) = Binding.submit(session, operation_id, inputs.versions, proposal)
+Accepted(ticket) = admission
+(session, outcome) = Binding.resolve(session, ticket)
+Binding.close(session, drain_deadline)
+
+Session = private affine capability
+InputView = generated values + dependency versions + connection generation
+Admission = NotAdmitted(proposal) | Accepted(ticket)
+CommitOutcome = Confirmed | DeclaredRejection | HostFailure | Uncertain(operation_id)
+```
+
+The resolve call applies only after `Accepted`; non-admission retains the proposal for the coordinator. Accepted messages are not resubmitted because a socket write blocks. A confirmed outcome includes publication of any result-embedded update; an uncertain outcome requires durable reconciliation.
+
+| Component | Ownership and interface |
+| --- | --- |
+| Bend application and coordinator | Business computation, ordering, job admission, and reconciliation through generated domain contracts |
+| Bend session and generated codecs | SpacetimeDB envelopes, connection metadata, call correlation, schema conversion, BSATN, and complete cache publication |
+| C effect adapter | Compiler-specific marshalling and runtime-thread transfer of bounded bytes through the private native ABI |
+| Rust static library | One independent socket worker per BendRT process, Tungstenite state, packed buffers, bounded queues, deadlines, and shutdown |
+| Generated Rust WASM module | Schema registrations and transactional checks/writes generated from Bend declarations; no dependency on the native transport library |
+
+The private native ABI uses fixed-width status records and byte spans, not Rust objects or WebSocket enums. Conceptual `start`, `offer`, `take`, and `stop` operations remain unimplemented. `offer` copies on successful admission and retains nothing on rejection. `take` copies one complete message, consuming it only when the supplied capacity is sufficient. Each allocation is released by its owner. Rust panics must not unwind across the C boundary. The exact affine capability, generation checks, linker integration, and error paths require Phase 1 qualification.
+
+### Packaging rationale
+
+The embedded Rust static library preserves the independent-thread ownership model without adding an executable, IPC protocol, and supervision boundary. It keeps transport types private, byte transfers bounded, and generated shims independent.
+
+The embedded worker accepts compiler-specific ABI coupling, initial byte copies, and shared-process failure in exchange for simpler deployment. A sidecar remains a possible redesign if linking or isolation requirements justify its extra IPC and lifecycle work. It is not a second production path. The initial dedicated-thread worker does not require Tokio; Tungstenite's nonblocking integration still needs fair read/write/flush scheduling.
+
+### Deferred Bend implementation
+
+Optional [Phase 7](ws-phased-plan.md#phase-7-revisit-an-all-bend-websocket-implementation) may replace the Rust transport after reliable SpacetimeDB integration. The public Bend bindings, application schemas, and generated Rust module shims retain the same contracts. This replacement needs independent scheduling and equivalent qualification; it is not achieved by replacing the Rust worker with `IO.fork` on Bend's computation loop.
+
+The pinned Base TCP interface transfers `List<&2, U32>`, not packed byte arrays. Send and receive convert between those lists and native buffers. A future Bend transport must address this representation cost and the computation-blocked event loop; a separate IO-focused Bend process is a possible probe, not a qualified replacement. [Base TCP constraints](#constraints-that-affect-the-design)
+
 ## Architecture understood
 
 The connector is an outbound client to SpacetimeDB. One logical service binding does not mean one socket or a Bend server exposed to the frontend. Several bindings can share one database connection. [Architecture, vocabulary and runtime](confluxion-arch1.md#runtime-architecture)
@@ -36,7 +85,7 @@ This report covers the transport, BSATN codecs, and session machinery needed for
 
 The findings use these source revisions:
 
-- Bend `9c586f094f4fc88bef440dc8b4d77a2f92c257cc`, the inspected `main` revision. The recommended Base APIs must exist in the compiler version actually selected for Confluxion. [Bend revision][bend-revision]
+- Historical Bend research used `9c586f094f4fc88bef440dc8b4d77a2f92c257cc`. Implementation uses Bend 2.0.40 from the [qualified profile](../bench/ws/profiles/local-v1.json); its ABI and lifecycle still need Phase 1 checks. [Historical Bend revision][bend-revision]
 - SpacetimeDB release `v2.15.0`, revision `07efb0c44c42288ed8e40dcece75659cf44ec80c`. [Release revision][stdb-revision]
 - RFC 6455 for WebSocket handshake, framing, and closure. [WebSocket standard][rfc]
 
@@ -103,7 +152,7 @@ The architecture's statement that low-level transport needs implementation remai
 
 ### Caller experience
 
-The coordinator starts the connector with deployment settings, credentials, resource limits, and generated contracts. It establishes the declared input subscription and waits for a consistent ready snapshot.
+The coordinator starts the connector with deployment settings, resource limits, and generated contracts. Under the [trusted-local policy](confluxion-arch1.md#trusted-local-access-policy), it connects anonymously without client credentials. It establishes the declared input subscription and waits for a consistent ready snapshot.
 
 For work in a partition, the coordinator obtains typed inputs and versions, computes a proposal, and submits a generated commit call. The connector returns a confirmed result, a declared rejection, a host failure, or an uncertain outcome after connection loss. It applies any result-embedded subscription update before reporting successful completion.
 
@@ -115,9 +164,9 @@ These are proposed responsibilities, not existing modules or APIs:
 
 | Module | Owns |
 | --- | --- |
-| WebSocket | HTTP upgrade, incremental framing, masking, fragmentation, Ping/Pong, Close, and TCP progress |
+| WebSocket | Rust/Tungstenite integration, configured limits, HTTP upgrade policy, control flushing, deadlines, and TCP progress |
 | BSATN | Byte readers/writers, scalar and collection encoding, checked lengths, and codec failures |
-| SpacetimeDB connector | Pinned envelopes, authentication state, request correlation, subscriptions, cache publication, and connection generations |
+| SpacetimeDB connector | Pinned envelopes, connection metadata, request correlation, subscriptions, cache publication, and connection generations |
 | Generated bindings | Application codecs, typed operations, row keys, subscriptions, and schema compatibility metadata |
 
 The WebSocket library handles complete binary messages without knowing SpacetimeDB or BSATN. The connector composes those libraries. Confluxion's public service interface exposes generated domain contracts rather than wire enums.
@@ -155,7 +204,7 @@ Packed byte blocks, bounded message descriptors, and a ring or slab pool avoid o
 
 ### Native effect boundary and lifecycle
 
-Bend permits custom C effects and supplies `io_work` for helper-thread native work. The subprocess effect already polls descriptors and manages buffers on a helper thread before packaging its result. [Foreign effects][bend-effects], [helper-thread example][bend-process]
+Bend permits custom C effects and supplies `io_work` for helper-thread native work. The selected Rust library connects through a small C effect adapter and manages its own independent worker lifecycle. The subprocess effect supplies a runtime integration reference, not the persistent transport implementation. [Foreign effects][bend-effects], [helper-thread example][bend-process]
 
 A persistent transport service is new integration work. It needs startup, native-state lifetime, wakeups, queue access, error propagation, and deterministic shutdown. Its background thread operates on native bytes and metadata. It must not construct Bend heap terms or call arbitrary Bend functions or Base channel internals concurrently without a verified runtime interface.
 
@@ -183,7 +232,7 @@ Every finite buffer eventually fills if sustained production exceeds consumption
 
 ### WebSocket work still required
 
-The first library needs these protocol components:
+The Rust library supplies the core protocol implementation. Our integration must configure and verify these behaviors rather than write another framing engine:
 
 - An HTTP/1.1 upgrade request and incremental response parser. Validate status 101, Upgrade and Connection headers, the selected subprotocol, and `Sec-WebSocket-Accept`.
 - SHA-1 and Base64 for accept-value validation. Omitting SSL does not remove this handshake requirement. These can be finite pure Bend helpers using U32 operations.
@@ -193,7 +242,7 @@ The first library needs these protocol components:
 - Continuation-frame assembly, interleaved control handling, mask/RSV/opcode validation, and close-code/reason validation.
 - Bounded frame/message sizes, header bytes, fragment counts, wait times, and close-handshake duration.
 
-These requirements come from [RFC 6455 sections 4 through 8][rfc]. The native protocol supports text and binary messages for conformance testing; the application's initial traffic is binary. Text validation includes fragmented UTF-8. The library does not offer WebSocket compression extensions.
+These requirements come from [RFC 6455 sections 4 through 8][rfc]. The configured Tungstenite client supports text and binary messages for conformance testing; the application's initial traffic is binary. Text validation includes fragmented UTF-8. WebSocket compression extensions remain disabled. Comparing our worker with a Tungstenite reference is an integration comparison; uWebSockets and Autobahn provide independent interoperability evidence.
 
 ## Gated implementation plan
 
@@ -237,9 +286,9 @@ SpacetimeDB supplies schema metadata and first-party code-generation machinery, 
 
 ## SpacetimeDB session details that must be correct
 
-### Authentication and framing
+### Anonymous local connection and framing
 
-The HTTP upgrade supports `Authorization: Bearer JWT`. The initial v2 message returns identity, connection ID, and a token. Credentials and identity continuity remain part of the session despite plaintext transport. [Upgrade handler][stdb-upgrade], [v2 schema][stdb-v2]
+The initial loopback connection omits `Authorization` and follows the [trusted-local policy](confluxion-arch1.md#trusted-local-access-policy). The initial v2 message still returns identity, connection ID, and a server-issued token. Decode these fields as protocol metadata. The local profile does not require login, credential checks, or identity continuity across reconnects; durable work is correlated by operation IDs and checkpoints. [Upgrade handler][stdb-upgrade], [v2 schema][stdb-v2]
 
 Client-to-server v2 traffic is one BSATN `ClientMessage` per binary WebSocket message, without a compression prefix. Server-to-client traffic has a prefix byte before the BSATN `ServerMessage`: 0 for none, 1 for Brotli, and 2 for gzip. `compression=None` still requires stripping byte 0. Omitted compression defaults to Brotli in this release. [SDK][stdb-sdk], [serialization][stdb-serialization], [common constants][stdb-common]
 
@@ -309,7 +358,7 @@ This is a substantial client-library project. TCP is already available, but a us
 
 The remaining work is concentrated in these areas:
 
-- WebSocket parsing and duplex scheduling have moderate protocol complexity. Slow peers and control-frame progress are the decisive cases.
+- Tungstenite integration and duplex scheduling still need qualification. Slow peers, configured limits, partial writes, and control-frame flushing are the decisive cases.
 - Protocol metadata needs exact wide integers, UTF-8 handling, and row-list decoding before simple application calls are sufficient.
 - Packed native buffer transfer, resource lifetime, snapshot staging, and queue limits need validation against real workloads.
 - Long Bend mappings delay application update processing even when the native thread continues socket receipt and Ping/Pong.
@@ -337,7 +386,7 @@ Pure-code proofs can establish codec and state-transition properties under decla
 
 ## Recommendation
 
-Follow the [phase plan](ws-phased-plan.md) before adding BSATN and the SpacetimeDB session. Use IPv4 loopback and uncompressed traffic.
+Follow the [phase plan](ws-phased-plan.md) through Phase 4, then start the SpacetimeDB delivery track. Use Rust/Tungstenite, IPv4 loopback, and uncompressed traffic. Throughput tuning, the computation pool, and optional all-Bend WebSockets are separate from delivering the initial reliable connection.
 
 The first decisive result is sustained bidirectional transport progress while Bend computes and peers apply backpressure. Native buffer ownership, deterministic shutdown, and uncertain-commit recovery must also pass before expanding generated service coverage.
 

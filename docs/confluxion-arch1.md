@@ -19,7 +19,7 @@ Bend defines business behavior and the CQRS coordination model. SpacetimeDB pers
 | WebSocket endpoint | A generated logical service binding over the Bend–SpacetimeDB connection, with declared input, output, and failure contracts. |
 | Bend service, or service | An explicitly exported Bend definition selected for generation. It owns the corresponding computation or projection behavior. |
 | Native connector | The Bend-owned transport and protocol component that connects to SpacetimeDB, sends calls, and receives replies and subscription updates. |
-| Module shim | Generated SpacetimeDB code that defines schema and executes authorization, dependency checks, and atomic database operations. |
+| Module shim | Generated SpacetimeDB code that defines schema, validates dependencies, and executes atomic database operations under the selected access policy. |
 | Coordinator | Bend code that owns ordered processing, batching, retries, recovery, and dispatch to service instances. |
 | Stream or partition | A declared ordering and state-ownership scope. Independent scopes can progress independently. |
 | Service instance | The Bend execution context for a declared service and processing scope. |
@@ -65,7 +65,7 @@ flowchart LR
 	Q -->|State subscription updates| F
 ```
 
-The native connector owns the Bend–SpacetimeDB protocol session. It decodes subscribed inputs, correlates call results, and supplies complete transaction updates to the coordinator. The coordinator selects the service and processing scope, obtains consistent inputs, and invokes Bend computation.
+The Bend session owns the Bend–SpacetimeDB protocol semantics. It decodes subscribed inputs, correlates call results, and supplies complete transaction updates to the coordinator. An independent Rust/Tungstenite worker supplies complete binary messages through the native effect boundary. The coordinator selects the service and processing scope, obtains consistent inputs, and invokes Bend computation.
 
 Bend computes a proposal without holding a database transaction open. A generated module operation validates the proposal against current state and commits its effects atomically. SpacetimeDB then supplies the frontend's matching subscription updates without a Bend relay.
 
@@ -83,7 +83,7 @@ Service definitions identify behavior. Stream or partition identities select pro
 
 Bend owns command decisions, event evolution, projection algorithms, batching, worker scheduling, and local resource lifecycles. The coordinator manages retry reconciliation and recovery from durable checkpoints.
 
-SpacetimeDB owns persisted event rows, materialized state, indexes, and transactional execution. Generated shims check authorization, expected checkpoints, dependency versions, operation identities, and any worker fencing conditions. These checks execute in the same transaction as the resulting writes.
+SpacetimeDB owns persisted event rows, materialized state, indexes, and transactional execution. Generated shims check expected checkpoints, dependency versions, operation identities, and any worker fencing conditions. These checks execute in the same transaction as the resulting writes. The initial deployment uses the [trusted-local access policy](#trusted-local-access-policy), with no application authorization checks.
 
 Event history is authoritative history. The event-to-state transaction is the authoritative transition. Materialized state and Bend's local copies can be reconstructed under the declared replay policy. A transaction is an operation, so its accepted effects and processing position require durable representation.
 
@@ -155,17 +155,31 @@ flowchart LR
 	G --> F
 ```
 
-Subscription helpers come from explicit read-model and visibility declarations. The generator does not infer authorization or mutable database dependencies from arbitrary business code. The frontend uses the standard SpacetimeDB client to execute the generated queries and maintain its cache.
+Subscription helpers come from explicit read-model and visibility declarations. The initial local profile exposes the declared read models without caller-based filtering. The generator does not infer mutable database dependencies from arbitrary business code. The frontend uses the standard SpacetimeDB client to execute the generated queries and maintain its cache.
 
 Generation is deterministic for the same declarations, policies, and generator version. It does not guarantee compatibility after a schema or behavior change.
 
 ## Low-level transport is a required component
 
-Current Bend has no WebSocket library. This architecture requires new low-level socket and WebSocket code for the native connector, together with the required native networking integration.
+Transport decision, November 24, 2026: reuse Rust/Tungstenite through an independently scheduled native worker rather than implement WebSocket framing in Bend. A small C effect adapter links the Rust library to BendRT. An all-Bend transport is deferred to optional Phase 7 of the [phase plan](ws-phased-plan.md). Application developers continue to write business behavior and authoritative schema declarations in Bend.
 
-The transport covers connection establishment, WebSocket framing, control messages, closure, and the networking services required by the configured deployment. The protocol layer covers SpacetimeDB negotiation, authentication, BSATN messages, compression, subscriptions, and request correlation. Generated codecs handle application values.
+The transport covers connection establishment, WebSocket framing, control messages, closure, and the networking services required by the configured deployment. The protocol layer covers SpacetimeDB negotiation, connection metadata, BSATN messages, compression, subscriptions, and request correlation. Generated codecs handle application values.
+
+There are two separate Rust artifacts: the native client transport and the generated SpacetimeDB WASM module. The transport contains no application-table schema. The module contains generated tables and transactional reducer checks, not the native socket worker or a second handwritten application algorithm. Both the module and Bend bindings derive their contracts from Bend declarations.
+
+Changing the client transport to Bend later does not change module generation when the BSATN schemas, reducer contracts, caller metadata, and SpacetimeDB protocol remain compatible. The host dispatches reducer arguments and caller context into the module; module shims do not receive the socket or HTTP upgrade. See [transport-independent shim generation](bend-shim-design.md#transport-independent-module-generation).
 
 This transport connects Bend to SpacetimeDB only. It is not a general external-service client or a public endpoint server. Its lifecycle belongs to the Bend coordinator rather than a Node controller.
+
+## Trusted-local access policy
+
+Decision, November 24, 2026: BendRT, the Rust worker, SpacetimeDB, and local clients run on the same trusted machine. The SpacetimeDB listener binds to IPv4 loopback `127.0.0.1`. The initial connection supplies no bearer token, JWT, or user login.
+
+Generated connection hooks and reducers use allow-all application access. They do not check caller identity, roles, or auth claims. Declared subscription read models are available to anonymous local clients, using public tables or unfiltered views as appropriate. No authentication provider or permission framework is required for this profile.
+
+SpacetimeDB still assigns a connection identity and returns protocol metadata, including a server-issued token. The connector decodes that metadata but does not require token reuse for local access. A reconnect can have a new identity. Durable operation IDs, checkpoints, and proposal identity therefore identify work independently of that connection identity. [Anonymous connections and reconnects](https://spacetimedb.com/docs/core-concepts/authentication/#server-issued-tokens-and-reconnects)
+
+Skipping auth does not skip BSATN/schema validation, descriptor bounds, dependency versions, fencing, duplicate-operation handling, or atomic commit checks. Those checks preserve correctness between concurrent local workers. This section is the access-policy authority for the initial deployment; the general authentication discussions in earlier research describe broader deployments.
 
 ## Build and publish are generated from Bend
 
@@ -175,7 +189,7 @@ Bend source includes the explicit persistence and query declarations needed for 
 
 The build produces the native Bend application, generated module artifacts, and frontend bindings. The publish script uses the standard SpacetimeDB tools for its module and deploys the native Bend worker beside the self-hosted database. Publishing the module alone does not deploy BendRT.
 
-Deployment targets, credentials, and process supervision are configured once. Changes to accepted event formats, projection semantics, or persisted schemas require an explicit migration or rebuild policy that the script can execute.
+Deployment targets and process supervision are configured once. The trusted-local profile requires no client credentials. Changes to accepted event formats, projection semantics, or persisted schemas require an explicit migration or rebuild policy that the script can execute.
 
 ## Closure, failure, and recovery
 

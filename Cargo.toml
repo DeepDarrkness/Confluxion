@@ -1,5 +1,5 @@
 [workspace]
-members = ["bench/ws/reference-rs"]
+members = ["bench/ws/reference-rs", "src/ws/native"]
 resolver = "2"
 
 [profile.release]
