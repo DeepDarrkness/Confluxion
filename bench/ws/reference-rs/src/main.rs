@@ -486,15 +486,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && t >= starts[epoch] + (last_sample[epoch] as u64 + 1) * 1_000_000_000
             {
                 for c in &mut conns {
+                    let sampled = now();
                     c.tx[epoch].samples.push([
-                        t,
+                        sampled,
                         c.tx[epoch].attempted,
                         c.tx[epoch].admitted,
                         c.tx[epoch].transmitted,
                         c.queue_bytes as u64,
                     ]);
                     c.rx[epoch].samples.push([
-                        t,
+                        sampled,
                         c.rx[epoch].validated,
                         c.rx[epoch].in_window,
                         0,
@@ -505,6 +506,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if !failure.is_null() {
+            break;
+        }
+        if t >= end
+            && std::env::var("WS_EARLY_DRAIN").is_ok_and(|v| v == "1")
+            && conns.iter().all(|c| {
+                c.pending.is_empty()
+                    && (0..2).all(|e| {
+                        c.tx[e].transmitted == rates[0] * durations[e]
+                            && c.rx[e].validated == rates[1] * durations[e]
+                    })
+            })
+        {
             break;
         }
     }

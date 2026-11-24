@@ -725,6 +725,31 @@ pub unsafe extern "C" fn ws_socket_fixture_memory(h: u64, idle: *mut u64, live: 
         Err(code) => code,
     }
 }
+#[no_mangle]
+pub unsafe extern "C" fn ws_socket_fixture_evidence(h: u64, values: *mut u64, count: u32) -> u32 {
+    if values.is_null() || count != 9 {
+        return INVALID;
+    }
+    match session(h, 1) {
+        Ok(s) => {
+            let p = s.client.status();
+            let evidence = [
+                p.incoming_partial_age.map_or(0, |v| v.as_nanos() as u64),
+                p.outgoing_partial_age.map_or(0, |v| v.as_nanos() as u64),
+                p.turns,
+                p.service_gap_peak.as_nanos() as u64,
+                p.read_service_gap_peak.as_nanos() as u64,
+                p.write_service_gap_peak.as_nanos() as u64,
+                p.control_service_gap_peak.as_nanos() as u64,
+                p.worker_tid as u64,
+                u64::from(p.allocation_invalid),
+            ];
+            std::ptr::copy_nonoverlapping(evidence.as_ptr(), values, evidence.len());
+            OK
+        }
+        Err(code) => code,
+    }
+}
 const _: () = {
     assert!(std::mem::size_of::<Span>() == 16);
     assert!(std::mem::size_of::<BatchTake>() == 40);

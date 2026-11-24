@@ -176,12 +176,16 @@ struct Engine {
         for(size_t epoch=0;epoch<2;epoch++) {
             while(last_sample[epoch]<durations[epoch] && t>=starts[epoch]+(last_sample[epoch]+1)*1000000000) {
                 last_sample[epoch]++;
-                for(auto &c:conns){auto &tx=c->tx[epoch];auto &rx=c->rx[epoch];
-                    tx.samples.push_back({t,tx.attempted,tx.admitted,tx.transmitted,c->queue_bytes});
-                    rx.samples.push_back({t,rx.validated,rx.in_window,0,0});}
+                for(auto &c:conns){auto &tx=c->tx[epoch];auto &rx=c->rx[epoch];auto sampled=clock_ns();
+                    tx.samples.push_back({sampled,tx.attempted,tx.admitted,tx.transmitted,c->queue_bytes});
+                    rx.samples.push_back({sampled,rx.validated,rx.in_window,0,0});}
             }
         }
-        if(failure!="null" || t>=end+drain*1000000000)finish();
+        bool exact=true;for(auto &c:conns)for(size_t epoch=0;epoch<2;epoch++)
+            if(!c->pending.empty() || c->tx[epoch].transmitted!=rates[1]*durations[epoch] || c->rx[epoch].validated!=rates[0]*durations[epoch])exact=false;
+        bool closed=true;for(auto &c:conns)if(!c->peer_closed)closed=false;
+        auto early=std::getenv("WS_EARLY_DRAIN");
+        if(failure!="null" || t>=end+drain*1000000000 || (t>=end && exact && closed && early && std::string(early)=="1"))finish();
     }
     [[noreturn]] void finish() {
         auto finished=clock_ns();std::ofstream o(report_path);
@@ -210,7 +214,9 @@ int main(int argc,char **argv) {
     e.rates={std::stoull(argv[5]),std::stoull(argv[6])};e.durations={std::stoull(argv[7]),std::stoull(argv[8])};
     e.drain=std::stoull(argv[9]);e.token=std::stoull(argv[10]);e.faultdir=std::stoi(argv[11]);e.fault=argv[12];e.saturation=std::string(argv[13])=="1";e.report_path=argv[14];
     if(auto pause=std::getenv("WS_PAUSE_RECEIVE_MS"))e.pause_ns=std::stoull(pause)*1000000;
-    if(!e.count || e.count>16 || e.size<64 || e.size>1048576 || !e.durations[1] || e.durations[1]>100)return 2;
+    auto long_measure=std::getenv("WS_LONG_MEASURE");
+    auto measure_limit=long_measure && std::string(long_measure)=="1" ? 1800u : 100u;
+    if(!e.count || e.count>16 || e.size<64 || e.size>1048576 || !e.durations[1] || e.durations[1]>measure_limit)return 2;
     fcntl(0,F_SETFL,O_NONBLOCK);
     if(e.mode=="tcp") {
         int listener=socket(AF_INET,SOCK_STREAM|SOCK_NONBLOCK,0);int one=1;setsockopt(listener,SOL_SOCKET,SO_REUSEADDR,&one,4);
@@ -235,7 +241,7 @@ int main(int argc,char **argv) {
         .open=[&e](WS *ws){ws->getUserData()->id=e.add(ws,int(reinterpret_cast<uintptr_t>(us_socket_get_native_handle(0,reinterpret_cast<us_socket_t*>(ws)))));},
         .message=[&e](WS *ws,std::string_view p,uWS::OpCode code){if(code!=uWS::BINARY)e.fail("opcode");else e.receive(ws->getUserData()->id,p);},
         .drain=[&e](WS *ws){e.flush(*e.conns[ws->getUserData()->id]);},
-        .close=[&e](WS *ws,int,std::string_view){auto &c=*e.conns[ws->getUserData()->id];if(e.start && clock_ns()>=e.end && c.pending.empty())c.peer_closed=true;else e.fail("transport");}
+        .close=[&e](WS *ws,int,std::string_view){auto &c=*e.conns[ws->getUserData()->id];if(!(e.start && clock_ns()>=e.end && c.pending.empty()))e.fail("transport");c.peer_closed=true;c.ws=nullptr;}
     }).listen("127.0.0.1",port,[port](auto *listener){if(!listener)std::exit(2);std::cout<<"LISTENING "<<port<<std::endl;});
     auto timer=us_create_timer((us_loop_t*)uWS::Loop::get(),0,0);
     us_timer_set(timer,[](us_timer_t*){engine->tick();},1,1);

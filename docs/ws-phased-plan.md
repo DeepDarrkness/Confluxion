@@ -15,7 +15,7 @@ Status as of November 24, 2026. The Phase 4 integration invocation passed all ro
 | 2 | Passed | Qualified bounded Tungstenite protocol integration | Post-cleanup gate passed in the Phase 3 integration run November 24, 2026; [verification](ws-phase2-verification.md), [evidence](../results/ws/cargo-1795511937858175300-97357/phase-2/summary.json) |
 | 3 | Passed | Independent full-duplex Rust transport | Real-peer interoperability, all 301 required cases under approved fixture rules, bounded overload, deadlines, and cleanup passed November 24, 2026; [verification](ws-phase3-verification.md), [evidence](../results/ws/cargo-1795512093612704375-99189/phase-3/summary.json) |
 | 4 | Passed | Complete Bend message path | Real Bend million-message transfer each way, bounded batches, independent IO during pure computation, pauses, and cleanup passed November 24, 2026; [verification](ws-phase4-verification.md#integration-qualification), [evidence](../results/ws/cargo-1795520741553854400-164059/phase-4/summary.json) |
-| 5 | Not started | Useful local throughput at bounded latency | Freeze the performance profile, qualify reference noise and headroom, then pass paired reference and Bend-overhead targets |
+| 5 | Blocked | Seven parallel routine checks with cached builds; explicit throughput qualification | [Full qualification](../results/ws/cargo-1795536337824877458-204758/phase-5/summary.json) failed the long-capacity gate after its frozen refinement limit. Five passing pairs were not established. Native soak was interrupted; Bend soak did not start. Work is checkpointed at user request; see [remaining work](#phase-5-checkpoint-november-24-2026) |
 | 6 | Not started | Bounded reusable computation workers | Pool limits, result correlation, compute correctness, and ordering pass under load |
 | 7 | Deferred; optional | All-Bend WebSocket implementation behind the same Bend API | Revisit after reliable Rust-backed SpacetimeDB integration; qualify equivalent interoperability, independent progress, bounds, and cleanup before replacement |
 
@@ -43,7 +43,7 @@ The smallest implementation units are organized by ownership:
 | `bench/ws/` | Independent peers, workloads, compute fixtures, and machine profiles |
 | `Cargo.toml` and `tests/ws/phase0.rs` | Build native fixtures and run the correctness gate through Cargo's Rust test framework |
 
-Phase 0 supplies the Cargo test, reference peers, correctness profile, and artifact format. Phase 1 implements `src/ws/` ownership and real Bend lifecycle fixtures. Phase 2 implements the bounded protocol adapter and prepared-IO qualification. Phase 3 adds the real socket worker and Cargo qualification. Phase 4 qualifies the real Bend socket path in the same Cargo suite. Verification below for phases 5 through 7 and the SpacetimeDB delivery track describes planned coverage. The current command does not imply those future phases exist or pass.
+Phase 0 supplies the Cargo test, reference peers, correctness profile, and artifact format. Phase 1 implements `src/ws/` ownership and real Bend lifecycle fixtures. Phase 2 implements the bounded protocol adapter and prepared-IO qualification. Phase 3 adds the real socket worker and Cargo qualification. Phase 4 qualifies the real Bend socket path. Phase 5 adds the scheduled controller and ignored performance qualification. Phases 6, 7, and the SpacetimeDB delivery track remain planned coverage. The current routine command does not qualify throughput or those future phases.
 
 Each Phase 0 invocation writes `results/ws/cargo-<run-id>/phase-0/summary.json`, actor reports, the profile, native build artifacts, command lines, and trial results. Planned conformance phases also retain case-level Autobahn output. Results are evidence artifacts produced during implementation, not measurements established by this plan.
 
@@ -57,7 +57,7 @@ Phase 4 qualification removed the temporary Autobahn Python runtime and optional
 
 ### Phase-scoped test selection
 
-Each Cargo integration target requires its matching `phase0` through `phase4` feature. The features are independent. `phase4` is currently the default; selecting a phase does not automatically select its predecessors. Update the default feature when implementation advances to a new phase.
+Each Cargo integration target requires its matching `phase0` through `phase5` feature. The features are independent. `phase5` is the default. Selecting a phase does not automatically select its predecessors.
 
 ```sh
 # Current phase, routine correctness
@@ -70,7 +70,7 @@ cargo test --release --locked -p ws-reference --no-default-features --features p
 cargo test --release --locked -p ws-reference --features phase3
 
 # Explicit complete Phase 4 qualification
-cargo test --release --locked -p ws-reference --test phase4 phase4_full_qualification -- --ignored --exact --test-threads=1
+cargo test --release --locked -p ws-reference --no-default-features --features phase4 --test phase4 phase4_full_qualification -- --ignored --exact --test-threads=1
 ```
 
 For a single selected target, add `--test phaseN` and enable its feature. Disabled targets are not compiled or executed. `--all-features` opts into all earlier suites. Run ignored qualification tests separately from routine checks.
@@ -149,12 +149,50 @@ Completed November 24, 2026. The [integration qualification](ws-phase4-verificat
 
 ## Phase 5. Tune and qualify local message throughput
 
+The default Cargo command runs seven independent scheduled delivery, integrity, bounds, and cleanup checks with shared cached builds. The seven-test run passed before the latest scoped fixes. Full qualification failed the long-capacity gate after the frozen refinement limit. Native soak was interrupted after a lifecycle-validator fault; the queued Bend soak did not start. The latest calibration command was interrupted during Cargo compilation. The [controller reference](ws-phase5-verification.md) records the frozen profile, commands, and failing gate. Performance targets remain unchanged.
+
 - Outcome: the standalone library meets explicit throughput, latency, and memory targets on the frozen local profile.
 - Owns: transport batching, buffer reuse, effect batching, and `bench/ws/` measurement adapters. Depends on phase 4; select earlier correctness suites only for boundaries affected by a change.
 - Smallest unit: change one measured limiter at a time. Compare immediate writes with bounded batches; compare reusable buffers and transfer representations; coalesce wakeups where correct. Preserve WebSocket message boundaries when batching writes. Do not merge application records into one message to inflate messages/second.
 - Verification: extend the Cargo suite with real Phase 5 checks and a separately frozen performance profile. No performance controller remains in revised Phase 0.
 - Gate: first qualify references with five paired trials per W1 and W2 core workload, 10 seconds of warmup, and 60 seconds of measurement. Reference throughput spread must be at most 5% of its median, and the generator and peer must sustain at least 1.25 times the chosen operating rate. Then median native capacity must be at least 80% of the equivalently configured Tungstenite client capacity against the same peer. Median full Bend-path capacity must be at least 80% of our native-only capacity. Each paired ratio must be at least 75%. At half the lower of the compared capacities, native scheduled-send-to-peer-receipt p99 is at most 1 ms and Bend scheduled-producer-to-application-consumer p99 is at most 2 ms, excluding job computation. Five 60-second trials pass with zero unexpected rejection, deadline expiry, integrity failure, or growing queue backlog. W4 overload and W5 soak must also pass.
 - Stop: these 80%, 75%, 1 ms, and 2 ms values are proposed engineering targets, not measured capabilities or universal standards. Phase 5 freezes its performance profile before comparison; an infeasible target requires an explicit revision and explanation, never silent lowering after a failed run. Noise-dominated or peer-limited comparisons are inconclusive and block a pass. Capture a profile and counters that identify the limiter before accepting a performance conclusion.
+
+### Phase 5 checkpoint, November 24, 2026
+
+Work is paused for documentation and temporary-file cleanup. Phase 5 is **Blocked**, not Passed. No benchmark or fixture process remains running.
+
+Implemented changes:
+
+- Independent `phase5` Cargo feature and default target.
+- Seven separately selectable routine tests, isolated ports and evidence, and bounded CPU-pair leases.
+- Shared native fixture caching with artifact checksums, per-input builder locks, parallel compilation units, and atomic publication. The final cache key fingerprints the fixture build recipe and C generator rather than unrelated test bodies.
+- Frozen performance profile, scheduled native and real Bend actors, short calibration, explicit long paired trials, bounded overload, persistent lifecycle checks, and checkpoint-driven soak.
+- `AGENTS.md` rules for scoped reruns, cached builds, independent correctness tests, and reserved performance CPU budgets.
+- Reference-peer close handling fixed after overload exposed reuse of a closed socket.
+- Injected-disconnect lifecycle trials retain missed arrivals without applying the normal W4 generator-capacity gate. Steady soak cancellation on lifecycle failure is implemented.
+
+Verified results:
+
+| Selected check | Result | Evidence |
+| --- | --- | --- |
+| Phase 5 routine target | Seven tests passed in 9.88 s after 7.63 s Cargo compilation; one fixture build, six cache hits | [Bend four-connection](../results/ws/cargo-1795535350842106141-203228/phase-5/summary.json), [native duplex](../results/ws/cargo-1795535350842135987-203228/phase-5/summary.json), [Bend overload](../results/ws/cargo-1795535350842124053-203228/phase-5/summary.json), and other test-owned directories from that invocation |
+| `phase5_reference_duplex` after the peer-close fix | Passed in 1.58 s with a cache hit, using CPUs 2 and 3 while qualification reserved 0 and 1 | [Summary](../results/ws/cargo-1795536489676483852-205108/phase-5/summary.json) |
+| Full qualification | Failed after 635.09 s at the frozen long-capacity refinement limit; five passing pairs were not established | [Summary](../results/ws/cargo-1795536337824877458-204758/phase-5/summary.json), [trials](../results/ws/cargo-1795536337824877458-204758/phase-5/trials.json) |
+| `overload_lifecycle` after the injected-fault rule and cancellation edits | Both native and Bend tests passed in 8.22 s after 7.62 s Cargo compilation; one build, one cache hit | [Native](../results/ws/cargo-1795537984389109583-208933/phase-5/summary.json), [Bend](../results/ws/cargo-1795537984389100334-208933/phase-5/summary.json) |
+| Native standalone soak | Interrupted; no 30-minute pass | [Interruption record](../results/ws/cargo-1795537370992791852-207644/phase-5/interruption.json) |
+| Bend standalone soak | Cancelled while waiting for the reserved CPU pair; no traffic trial started | No pass |
+| Latest `phase5_calibrate_soak` | Interrupted during Cargo compilation after the final build-recipe fingerprint edit | No final checkpoint or pass |
+
+The final recipe-fingerprint edit has not been executed. Cancellation after a lifecycle failure has not been exercised in a completed soak. Previously passed unchanged phases were not rerun during the test-cleanup work.
+
+Resume in this order:
+
+1. Run the build/cache probe against the final source: `cargo test --release --locked --test phase5 phase5_fixture_build_probe -- --ignored --exact --nocapture`.
+2. Regenerate the measured-rate checkpoint with `phase5_calibrate_soak`. Old checkpoints can have a different fixture key and must not be relabeled as final-build measurements.
+3. Run `phase5_standalone_soak` with `WS_PHASE5_SOAK_CHECKPOINT` pointing to that new checkpoint and `WS_PHASE5_SOAK_PATH=Native`, then `Bend`. Verify every persistent lifecycle cycle, exact outcomes, resource restoration, and the complete steady interval.
+4. Capture CPU profiles and counters to identify the long-trial limiter, establish repeatable capacity, and rerun the affected qualification. `perf` and `strace` must be provisioned again; this session's temporary tools were removed. This host supports `cpu-clock:u` and software counters, but not hardware cycles or instructions.
+5. Mark Phase 5 Passed only after all frozen noise, headroom, paired-ratio, half-load latency, W4, and W5 gates pass. Advance to Phase 6 afterward.
 
 ## Phase 6. Validate the bounded computation pool
 
