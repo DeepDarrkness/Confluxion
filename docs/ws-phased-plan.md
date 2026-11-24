@@ -6,11 +6,11 @@ Design: when changing socket ownership or computation scheduling, read the [sele
 
 ## Current status
 
-Status as of November 23, 2026. Phase 0's small native-build and correctness suite is consolidated under Cargo. The Python runner is deleted. Qualification is still TODO: the Rust migration was not rerun, as requested; the previous correctness pass applies to the earlier runner. The original multi-hour baseline, noise, and headroom gate was removed by user choice, not passed. Throughput qualification remains TODO for Phase 5. See [Phase 0 verification](ws-phase0-verification.md). The status table is authoritative for phase progress.
+Status as of November 24, 2026. Phase 0 passed its Cargo native-build and correctness qualification. The fresh run passed all nine trials and damaged-evidence checks. See [qualification results and the exact command](ws-phase0-verification.md#completed-qualification) and the [run summary](../results/ws/cargo-1795497449219896432-3075/phase-0/summary.json). The original multi-hour baseline, noise, and headroom gate was removed by user choice, not passed. Throughput qualification remains TODO for Phase 5. The status table is authoritative for phase progress.
 
 | Phase | Status | Checkable outcome | Required gate before proceeding |
 | --- | --- | --- | --- |
-| 0 | Consolidated; qualification TODO | Cargo owns native builds, million-message integrity each way, four fault controls, four reference-bound trials, and damaged-evidence rejection | Run the Cargo correctness gate; Rust migration not rerun by request, and qualification remains incomplete |
+| 0 | Passed | Cargo owns native builds, million-message integrity each way, four fault controls, four reference-bound trials, and damaged-evidence rejection | Cargo correctness gate passed November 24, 2026; [verification](ws-phase0-verification.md#completed-qualification), [evidence](../results/ws/cargo-1795497449219896432-3075/phase-0/summary.json) |
 | 1 | Not started | Valid native resource/effect ownership | Real Bend start, transfer, release, and shutdown cycles pass |
 | 2 | Not started | Correct incremental WebSocket protocol | Protocol vectors, fault injection, and independent decoding pass |
 | 3 | Not started | Independent full-duplex native transport | Real-peer interoperability, client conformance, and bounded-overload tests pass |

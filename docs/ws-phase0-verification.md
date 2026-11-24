@@ -52,4 +52,28 @@ Each run creates `results/ws/cargo-<run-id>/phase-0/`. It retains a compact summ
 
 Native reports still contain histograms, but this suite makes no latency or throughput claim. These references are not the later Confluxion library. Allocations inside dynamically linked native libraries remain outside the tracked allocator wrappers.
 
-The Cargo migration was consolidated without another test run or GitHub runner configuration, as requested. Historical ignored evidence remains unchanged, including the previously passing correctness suite `phase0-minimal-correctness`, the failed original noise-gate run `phase0-qualification-reviewed`, and the interrupted qualification run `phase0-qualification-complete`. The previous run does not verify the Rust migration or establish completed throughput qualification.
+Historical ignored evidence remains unchanged, including the previously passing correctness suite `phase0-minimal-correctness`, the failed original noise-gate run `phase0-qualification-reviewed`, and the interrupted qualification run `phase0-qualification-complete`. Those runs do not verify the Rust migration or establish completed throughput qualification.
+
+## Completed qualification
+
+Phase 0 passed on November 24, 2026. `phase0_native_correctness` passed under Cargo with no failed, ignored, or filtered integration tests. The [fresh summary](../results/ws/cargo-1795497449219896432-3075/phase-0/summary.json) records `phase_pass=true`, nine passing trials, and `damaged_evidence_rejected=true`.
+
+The exact command on this host was:
+
+```sh
+CC=/usr/lib/llvm-19/bin/clang CXXFLAGS=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13 cargo test --release --locked
+```
+
+Clang 19 is installed outside `PATH`. Its default GCC 14 selection lacks C++ headers on this host, so `CXXFLAGS` selects the installed GCC 13 headers and libraries. The initial run failed at C++ compilation; the corrected run built fresh native fixtures and passed. No implementation or test-source changes were needed.
+
+Preparation confirmed both cached upstream revisions against `local-v1`, verified the Bend archive SHA-256, and restored Bend 2.0.40. The fresh build verified Bend's version, compiled and executed the per-run native ELF sentinel, and matched both reference actors to the exact payload vector.
+
+| Check | Observed result | Evidence in the fresh run |
+| --- | --- | --- |
+| Native builds and reference vectors | Fresh Bend ELF executes the exact sentinel; both reference vectors match | `build/`, `build/vectors.json`, `commands.json` |
+| Million-message integrity | Each actor transmits and validates 1,000,000 messages; zero rejection; sender and receiver digests agree | `trials/integrity-million/` |
+| Four fault controls | Both receivers detect duplicate and corrupt messages at sequence 50 with exit status 1 | `trials/integrity.duplicate.{0,1}/`, `trials/integrity.corruption.{0,1}/` |
+| Four paused-receiver trials | Every trial rejects excess work and drains all admitted messages; queue and tracked-heap peaks stay within the checked limits | `trials/bounds/{ws,tcp}/{client,server}/` |
+| Damaged-evidence rejection | Missing, mismatched, malformed, and false-success evidence all reject | `summary.json`, [Cargo assertions](../tests/ws/phase0.rs) |
+
+All evidence paths in the table are relative to [the fresh Phase 0 run](../results/ws/cargo-1795497449219896432-3075/phase-0/). These generated artifacts are local and ignored by Git. This qualification verifies the Cargo migration and completes the revised Phase 0 gate. Throughput, latency, noise, and sustained headroom remain Phase 5 work.
