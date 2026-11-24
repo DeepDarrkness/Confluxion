@@ -7,7 +7,14 @@ edition = "2021"
 tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 serde_json = "=1.0.145"
 libc = "=0.2.177"
+
+[dev-dependencies]
 confluxion-ws-native = { path = "../../../src/ws/native" }
+
+[[bin]]
+name = "ws-reference"
+path = "src/main.rs"
+test = false
 
 [[test]]
 name = "phase1"

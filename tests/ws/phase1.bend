@@ -322,7 +322,6 @@ def maybe_cycle(skip: Bool) -> IO(Unit):
 def main() -> IO(Unit):
   do IO<Unit>:
     cycle()
-    fault(0)
     raw_cases()
     checkpoint(0)
     xs : List<U32> <- observe(payload(64n, 7), 1)

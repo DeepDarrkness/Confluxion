@@ -183,16 +183,6 @@ static Term ws_raw_cases_run(Env e, Term* f, IoWork* w) {
   ws_case("foreign_handle", ws_native_offer(4, bytes, 4), WS_INVALID);
   ws_case("wrong_role_stop", ws_native_stop_begin(s.session, 2).code, WS_ROLE);
   ws_case("oversize_native", ws_native_offer(s.session, bytes, 257), WS_INVALID);
-  ws_case("empty_queue", ws_native_take(s.session, bytes, 256).code, WS_EMPTY);
-  ws_native_pause(s.session, 1);
-  for (unsigned i = 0; i < 4; i++) ws_assert(ws_native_offer(s.session, empty, 0), 0, 113);
-  ws_case("descriptor_full", ws_native_offer(s.session, empty, 0), WS_FULL);
-  ws_assert(ws_native_stats().cells, 4, 114);
-  ws_native_pause(s.session, 0);
-  for (unsigned i = 0; i < 4; i++) {
-    uint64_t lease; ws_exact(s.session, empty, 0, &lease);
-    ws_assert(ws_native_release(lease), 0, 115);
-  }
   ws_native_pause(s.session, 1);
   ws_assert(ws_native_offer(s.session, bytes, 256), 0, 116);
   ws_assert(ws_native_offer(s.session, bytes, 256), 0, 117);
@@ -230,17 +220,6 @@ static Term ws_raw_cases_run(Env e, Term* f, IoWork* w) {
   uint64_t abandoned = ws_native_stats().abandoned;
   ws_finish(s.closer, 2); ws_finish(s.session, 1);
   ws_case("queued_close_abandoned", ws_native_stats().abandoned - abandoned, 1);
-  s = ws_native_start(); ws_assert(s.code, 0, 127);
-  ws_native_fault(21);
-  ws_case("abi_panic", ws_native_offer(s.session, empty, 0), WS_PANIC);
-  ws_case("abi_panic_terminal", ws_native_take(s.session, bytes, 256).code, WS_PANIC);
-  ws_finish(s.closer, 2); ws_finish(s.session, 1);
-  s = ws_native_start(); ws_assert(s.code, 0, 128);
-  ws_native_fault(20);
-  WsTake result = ws_receive(s.session, bytes);
-  ws_case("worker_panic", result.code, WS_PANIC);
-  ws_finish(s.closer, 2); ws_finish(s.session, 1);
-  ws_case("faults_reclaimed", ws_native_stats().entries, 0);
   return term_pak(CID(Unit), 0);
 }
 

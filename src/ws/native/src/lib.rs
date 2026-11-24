@@ -868,11 +868,6 @@ pub extern "C" fn ws_native_pause(key: u64, pause: u32) -> u32 {
         OK
     })
 }
-#[no_mangle]
-pub extern "C" fn ws_native_probe(key: u64) -> u64 {
-    contain(0, || key)
-}
-
 pub fn build_marker() -> &'static str {
     env!("CONFLUXION_WS_BUILD_MARKER")
 }

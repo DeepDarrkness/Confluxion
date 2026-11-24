@@ -7,7 +7,6 @@ Confluxion is an event-sourced, reactive backend built on SpacetimeDB and Bend.
 - [Desired architecture](confluxion-arch1.md) defines service bindings, coordination, transactions, and recovery.
 - [WebSocket design](bend-websocket-design.md) describes the native transport, BSATN codecs, and SpacetimeDB session.
 - [WebSocket phase plan](ws-phased-plan.md) tracks implementation status, phase gates, and local benchmark workloads.
-- [Phase 1 ownership qualification](ws-phase1-verification.md) records the real Bend lifecycle gate, resource accounting, and sanitizer coverage.
 - [Raw BSATN shim design](bend-shim-design.md) describes generated transactional writes without module-side row reserialization.
 - [Connector feasibility](spacetime-bend.md) assesses external Bend execution and event-sourced projections.
 - [CQRS and platform reuse](spacetime-bend-cqrs.md) covers subscriptions, generation, frontend integration, and CLI reuse.
