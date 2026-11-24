@@ -12,7 +12,7 @@ Status as of November 24, 2026. The Phase 2 integration run passed all three Car
 | --- | --- | --- | --- |
 | 0 | Passed | Cargo owns native builds, million-message integrity each way, four fault controls, four reference-bound trials, and damaged-evidence rejection | Cargo correctness gate rerun passed November 24, 2026; [verification](ws-phase0-verification.md#completed-qualification), [evidence](../results/ws/cargo-1795507779180348826-69045/phase-0/summary.json) |
 | 1 | Passed | Valid native resource/effect ownership | Post-cleanup rerun passed 1,000 real Bend cycles per instrumentation mode, resource baseline restoration, faults, and waiting-close November 24, 2026; [evidence](../results/ws/cargo-1795507824100303680-69116/phase-1/summary.json) |
-| 2 | Passed | Qualified bounded Tungstenite protocol integration | Full Cargo suite passed November 24, 2026; [verification](ws-phase2-verification.md), [evidence](../results/ws/cargo-1795507831166507249-72209/phase-2/summary.json) |
+| 2 | Passed; cleanup not rerun | Qualified bounded Tungstenite protocol integration | Full Cargo suite passed November 24, 2026 before cleanup; [verification](ws-phase2-verification.md), [evidence](../results/ws/cargo-1795507831166507249-72209/phase-2/summary.json). Cleanup was not rerun at the user's request. |
 | 3 | Not started | Independent full-duplex Rust transport | Real-peer interoperability, client conformance, and bounded-overload tests pass |
 | 4 | Not started | Complete Bend message path | Bend payloads cross the effects correctly; native IO progresses during computation |
 | 5 | Not started | Useful local throughput at bounded latency | Freeze the performance profile, qualify reference noise and headroom, then pass paired reference and Bend-overhead targets |
@@ -78,6 +78,8 @@ Testing cleanup removed the redundant `42` ABI smoke fixture, Rustup fallback se
 ## Phase 2. Qualify the Rust WebSocket protocol integration
 
 Completed November 24, 2026. The [qualification report](ws-phase2-verification.md) records the adapter API, configured bounds, independent wire checks, and derived dependency allocation ceiling. The full Cargo suite passed Phases 0, 1, and 2 in the integration checkout.
+
+Subsequent cleanup removed upstream-only parser probes, repeated admission and invalid-Close checks, an unused test lifetime, and the session's temporary design files and implementation worktree. Adapter rejection cases and allocation checks remain in the Cargo gate. Tests were not rerun after cleanup, at the user's request.
 
 - Outcome: configured Tungstenite behavior preserves correct wire messages independently of Bend application logic.
 - Owns: Tungstenite configuration, handshake/subprotocol policy, IO adapter, and integration fixtures in `tests/ws/`. Depends on phase 1's resource and buffer representation.

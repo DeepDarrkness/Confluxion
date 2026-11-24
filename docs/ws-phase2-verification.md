@@ -4,7 +4,7 @@ Phase 2 qualifies the bounded native client adapter independently of Bend applic
 
 ## Ownership and policy
 
-`src/ws/native/src/protocol.rs` uses the selected B design. `Upgrade<S>::resume` consumes the same handshake continuation and returns either the next `Upgrade` or a `Protocol<S>`. Both own generic `Read + Write` IO. Tungstenite, HTTP, and Bytes representations remain behind the native Rust API.
+`src/ws/native/src/protocol.rs` separates handshake and established-protocol ownership. `Upgrade<S>::resume` consumes the same handshake continuation and returns either the next `Upgrade` or a `Protocol<S>`. Both own generic `Read + Write` IO. Tungstenite, HTTP, and Bytes representations remain behind the native Rust API.
 
 `Protocol::offer` accepts a borrowed binary or text message once. `Accepted` transfers responsibility, even when writing encounters `WouldBlock`. `Rejected` does not copy the input. Only `flush` resumes accepted output. One pending application frame occupies the admission slot, including an empty frame. There is no new application queue. A read conservatively requires a flush because Tungstenite may queue automatic controls. Two successful dependency flush calls drain a deferred automatic control before clearing admission.
 
@@ -12,7 +12,7 @@ Phase 2 qualifies the bounded native client adapter independently of Bend applic
 
 The handshake wrapper stages at most 12,288 bytes until `CRLF CRLF`. Its 8,192-byte header cap excludes the bounded coalesced frame suffix. Replay preserves both Tungstenite's `from_partially_read` tail and the wrapper's remaining bytes. Underlying one-byte reads do not become one-byte successful reads inside Tungstenite's `AttackCheck`.
 
-The A graft is a fixed 14-byte ingress header guard. Executed probes show that Tungstenite 0.28.0 accepts nonminimal extended lengths and parses a forbidden 64-bit high bit. The guard checks only those numeric rules, including the coalesced handshake suffix. Tungstenite still owns opcodes, masking, fragmentation, UTF-8, controls, and Close. No protocol core is copied or forked.
+The adapter has a fixed 14-byte ingress header guard. The recorded qualification probes showed that Tungstenite 0.28.0 accepts nonminimal extended lengths and parses a forbidden 64-bit high bit. The guard checks only those numeric rules, including the coalesced handshake suffix. Tungstenite still owns opcodes, masking, fragmentation, UTF-8, controls, and Close. No protocol core is copied or forked.
 
 ## Limits
 
@@ -99,3 +99,9 @@ CC=/usr/lib/llvm-19/bin/clang CXXFLAGS=--gcc-install-dir=/usr/lib/gcc/x86_64-lin
 All three Cargo tests passed. The [Phase 0 summary](../results/ws/cargo-1795507779180348826-69045/phase-0/summary.json) records nine passing trials and damaged-evidence rejection. The [Phase 1 summary](../results/ws/cargo-1795507824100303680-69116/phase-1/summary.json) records 1,000 cycles, 22 fault records, and 11 Bend boundary checks per ownership and ASan/UBSan mode. Each mode restored the two-block, 24-byte Bend baseline. `rustfmt --check` on the modified Rust files and `git diff --check` also passed.
 
 The first integration command stopped before fixtures because `clang` was absent from `PATH`. The recorded compiler settings resolved that environment issue. The [initial failed Phase 2 artifact](../results/ws/cargo-1795506795352918007-64867/phase-2/summary.json) retains its incomplete-gate status, and the [focused passing artifact](../results/ws/cargo-1795507246440860829-66070/phase-2/summary.json) remains available. Results directories are ignored by Git and are present in the integration checkout.
+
+## Cleanup after qualification
+
+Cleanup removed the direct upstream parser probes. The adapter's nonminimal-length and high-bit rejection cases remain. Busy rejection now runs once per partial-write quantum and once in the instrumented saturation scenario. Oversize and invalid-Close checks no longer repeat across unrelated memory scenarios. The test helper's unused lifetime annotation was removed.
+
+The temporary design sketches and implementation worktree were removed after verifying that their implementation files were already in commit `a023f50`. Historical qualification artifacts remain in the main checkout. Tests were not rerun after cleanup, at the user's request. The passing results above describe the pre-cleanup suite.
