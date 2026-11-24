@@ -28,6 +28,7 @@ name = "confluxion-ws-native"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tungstenite",
 ]
 
 [[package]]
@@ -352,6 +353,8 @@ version = "0.1.0"
 dependencies = [
  "confluxion-ws-native",
  "libc",
+ "rand",
+ "rand_chacha",
  "serde_json",
  "tungstenite",
 ]

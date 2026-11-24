@@ -6,13 +6,13 @@ Design: when changing socket ownership or computation scheduling, read the [sele
 
 ## Current status
 
-Status as of November 24, 2026. Phases 0 and 1 passed the Cargo suite before the testing cleanup. That invocation passed all nine Phase 0 trials and qualified real Bend effect ownership in instrumented and sanitizer modes. See [Phase 0 qualification](ws-phase0-verification.md#completed-qualification), the [Phase 0 summary](../results/ws/cargo-1795505060696688630-53818/phase-0/summary.json), and the [Phase 1 summary](../results/ws/cargo-1795505106060709584-53967/phase-1/summary.json). The suite was not rerun after cleanup, at the user's request. The original multi-hour baseline, noise, and headroom gate was removed by user choice, not passed. Throughput qualification remains TODO for Phase 5. The status table is authoritative for phase progress.
+Status as of November 24, 2026. The Phase 2 integration run passed all three Cargo tests, including all nine Phase 0 trials and 1,000 real Bend ownership cycles in each instrumentation mode after the testing cleanup. See the [Phase 0 summary](../results/ws/cargo-1795507779180348826-69045/phase-0/summary.json), [Phase 1 summary](../results/ws/cargo-1795507824100303680-69116/phase-1/summary.json), and [Phase 2 qualification](ws-phase2-verification.md). The original multi-hour baseline, noise, and headroom gate was removed by user choice, not passed. Throughput qualification remains TODO for Phase 5. The status table is authoritative for phase progress.
 
 | Phase | Status | Checkable outcome | Required gate before proceeding |
 | --- | --- | --- | --- |
-| 0 | Passed | Cargo owns native builds, million-message integrity each way, four fault controls, four reference-bound trials, and damaged-evidence rejection | Cargo correctness gate passed November 24, 2026; [verification](ws-phase0-verification.md#completed-qualification), [evidence](../results/ws/cargo-1795497449219896432-3075/phase-0/summary.json) |
-| 1 | Passed; cleanup not rerun | Valid native resource/effect ownership | 1,000 real Bend cycles per instrumentation mode, resource baseline restoration, faults, and waiting-close passed November 24, 2026; [evidence](../results/ws/cargo-1795505106060709584-53967/phase-1/summary.json). Testing cleanup was not rerun at the user's request. |
-| 2 | Not started | Qualified Tungstenite protocol integration | Configured limits, handshake checks, partial IO, and independent decoding pass |
+| 0 | Passed | Cargo owns native builds, million-message integrity each way, four fault controls, four reference-bound trials, and damaged-evidence rejection | Cargo correctness gate rerun passed November 24, 2026; [verification](ws-phase0-verification.md#completed-qualification), [evidence](../results/ws/cargo-1795507779180348826-69045/phase-0/summary.json) |
+| 1 | Passed | Valid native resource/effect ownership | Post-cleanup rerun passed 1,000 real Bend cycles per instrumentation mode, resource baseline restoration, faults, and waiting-close November 24, 2026; [evidence](../results/ws/cargo-1795507824100303680-69116/phase-1/summary.json) |
+| 2 | Passed | Qualified bounded Tungstenite protocol integration | Full Cargo suite passed November 24, 2026; [verification](ws-phase2-verification.md), [evidence](../results/ws/cargo-1795507831166507249-72209/phase-2/summary.json) |
 | 3 | Not started | Independent full-duplex Rust transport | Real-peer interoperability, client conformance, and bounded-overload tests pass |
 | 4 | Not started | Complete Bend message path | Bend payloads cross the effects correctly; native IO progresses during computation |
 | 5 | Not started | Useful local throughput at bounded latency | Freeze the performance profile, qualify reference noise and headroom, then pass paired reference and Bend-overhead targets |
@@ -43,7 +43,7 @@ The smallest implementation units are organized by ownership:
 | `bench/ws/` | Independent peers, workloads, compute fixtures, and machine profiles |
 | `Cargo.toml` and `tests/ws/phase0.rs` | Build native fixtures and run the correctness gate through Cargo's Rust test framework |
 
-Phase 0 supplies the Cargo test, reference peers, correctness profile, and artifact format. Phase 1 implements `src/ws/` ownership and real Bend lifecycle fixtures. Verification below for phases 2 through 7 and the SpacetimeDB delivery track describes planned coverage, not currently executable checks. Later phases add real checks to the same Cargo test framework; the current command does not imply future phases exist or pass.
+Phase 0 supplies the Cargo test, reference peers, correctness profile, and artifact format. Phase 1 implements `src/ws/` ownership and real Bend lifecycle fixtures. Phase 2 implements the bounded protocol adapter and prepared-IO qualification. Verification below for phases 3 through 7 and the SpacetimeDB delivery track describes planned coverage, not currently executable checks. Later phases add real checks to the same Cargo test framework; the current command does not imply future phases exist or pass.
 
 Each Phase 0 invocation writes `results/ws/cargo-<run-id>/phase-0/summary.json`, actor reports, the profile, native build artifacts, command lines, and trial results. Planned conformance phases also retain case-level Autobahn output. Results are evidence artifacts produced during implementation, not measurements established by this plan.
 
@@ -73,9 +73,11 @@ The implementation uses affine `Session`, `Closer`, and `Lease` wrappers around 
 
 `tests/ws/phase1.rs` retains the real Bend fixture, live allocation accounting, affine duplication rejection, damaged-evidence checks, and the omitted-release leak control. It selects Cargo's static archive using the linked build marker. Clang ASan/UBSan cover Bend and C; Rust allocations are intercepted, but Rust code is not compiler-sanitizer-instrumented. The sanitizer build uses `-O0` for the pinned runtime's calling-convention constraint.
 
-Testing cleanup removed the redundant `42` ABI smoke fixture, Rustup fallback self-test and diagnostics, synthetic stale-archive files, duplicate C fault cases, and empty Cargo unit/doc-test targets. The retained suite defines 22 fault records and 11 Bend boundary checks; report-damage controls run once rather than once per instrumentation mode. The separate qualification report and temporary design/probe artifacts were removed. Historical results remain unchanged. Tests were not rerun after these changes, at the user's request.
+Testing cleanup removed the redundant `42` ABI smoke fixture, Rustup fallback self-test and diagnostics, synthetic stale-archive files, duplicate C fault cases, and empty Cargo unit/doc-test targets. The retained suite defines 22 fault records and 11 Bend boundary checks; report-damage controls run once rather than once per instrumentation mode. The separate qualification report and temporary design/probe artifacts were removed. Historical results remain unchanged. Tests were not rerun at cleanup time, at the user's request. The Phase 2 integration run subsequently passed the retained suite in both instrumentation modes.
 
 ## Phase 2. Qualify the Rust WebSocket protocol integration
+
+Completed November 24, 2026. The [qualification report](ws-phase2-verification.md) records the adapter API, configured bounds, independent wire checks, and derived dependency allocation ceiling. The full Cargo suite passed Phases 0, 1, and 2 in the integration checkout.
 
 - Outcome: configured Tungstenite behavior preserves correct wire messages independently of Bend application logic.
 - Owns: Tungstenite configuration, handshake/subprotocol policy, IO adapter, and integration fixtures in `tests/ws/`. Depends on phase 1's resource and buffer representation.

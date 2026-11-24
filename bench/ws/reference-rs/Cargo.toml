@@ -10,6 +10,8 @@ libc = "=0.2.177"
 
 [dev-dependencies]
 confluxion-ws-native = { path = "../../../src/ws/native" }
+rand = "=0.9.5"
+rand_chacha = "=0.9.0"
 
 [[bin]]
 name = "ws-reference"
@@ -23,3 +25,7 @@ path = "../../../tests/ws/phase1.rs"
 [[test]]
 name = "phase0"
 path = "../../../tests/ws/phase0.rs"
+
+[[test]]
+name = "phase2"
+path = "../../../tests/ws/phase2.rs"

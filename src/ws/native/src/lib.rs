@@ -1,3 +1,5 @@
+pub mod protocol;
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -25,6 +27,65 @@ const MAX: usize = 256;
 const BYTE_LIMIT: usize = 512;
 
 struct Tracked;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocationScope {
+    pub live: usize,
+    pub blocks: usize,
+    pub peak: usize,
+    pub allocations: usize,
+    pub frees: usize,
+    pub reallocations: usize,
+    pub zeroed: usize,
+    pub largest: usize,
+    pub alignment: usize,
+    pub invalid: bool,
+}
+thread_local! {
+    static SCOPE: std::cell::Cell<Option<AllocationScope>> = const { std::cell::Cell::new(None) };
+}
+pub fn allocation_scope_start() {
+    SCOPE.with(|s| {
+        assert!(s.get().is_none());
+        s.set(Some(AllocationScope::default()));
+    });
+}
+pub fn allocation_scope_snapshot() -> AllocationScope {
+    SCOPE.with(|s| s.get().unwrap())
+}
+pub fn allocation_scope_finish() -> AllocationScope {
+    SCOPE.with(|s| s.replace(None).unwrap())
+}
+fn scope_event(l: Layout, allocate: bool) {
+    let _ = SCOPE.try_with(|s| {
+        if let Some(mut state) = s.get() {
+            if allocate {
+                state.live = scope_add(state.live, l.size(), &mut state.invalid);
+                state.blocks = scope_add(state.blocks, 1, &mut state.invalid);
+                state.allocations = scope_add(state.allocations, 1, &mut state.invalid);
+                state.peak = state.peak.max(state.live);
+                state.largest = state.largest.max(l.size());
+                state.alignment = state.alignment.max(l.align());
+            } else {
+                state.frees = scope_add(state.frees, 1, &mut state.invalid);
+                if state.live < l.size() || state.blocks == 0 {
+                    state.invalid = true;
+                }
+                state.live = state.live.saturating_sub(l.size());
+                state.blocks = state.blocks.saturating_sub(1);
+            }
+            s.set(Some(state));
+        }
+    });
+}
+fn scope_add(value: usize, increment: usize, invalid: &mut bool) -> usize {
+    match value.checked_add(increment) {
+        Some(n) => n,
+        None => {
+            *invalid = true;
+            usize::MAX
+        }
+    }
+}
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicU64 = AtomicU64::new(0);
 static BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -71,9 +132,38 @@ fn allocation_event(l: Layout, allocate: bool) {
     LAYOUT_OVERFLOW.fetch_add(1, SeqCst);
 }
 unsafe impl GlobalAlloc for Tracked {
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        let p = self.alloc(l);
+        if !p.is_null() {
+            std::ptr::write_bytes(p, 0, l.size());
+            let _ = SCOPE.try_with(|s| {
+                if let Some(mut state) = s.get() {
+                    state.zeroed = scope_add(state.zeroed, 1, &mut state.invalid);
+                    s.set(Some(state));
+                }
+            });
+        }
+        p
+    }
+    unsafe fn realloc(&self, p: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
+        let new = Layout::from_size_align_unchecked(new_size, old.align());
+        let q = self.alloc(new);
+        if !q.is_null() {
+            std::ptr::copy_nonoverlapping(p, q, old.size().min(new_size));
+            self.dealloc(p, old);
+            let _ = SCOPE.try_with(|s| {
+                if let Some(mut state) = s.get() {
+                    state.reallocations = scope_add(state.reallocations, 1, &mut state.invalid);
+                    s.set(Some(state));
+                }
+            });
+        }
+        q
+    }
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
         if !p.is_null() {
+            scope_event(l, true);
             allocation_event(l, true);
             ALLOCS.fetch_add(1, SeqCst);
             BLOCKS.fetch_add(1, SeqCst);
@@ -83,6 +173,7 @@ unsafe impl GlobalAlloc for Tracked {
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        scope_event(l, false);
         allocation_event(l, false);
         LIVE.fetch_sub(l.size() as u64, SeqCst);
         BLOCKS.fetch_sub(1, SeqCst);

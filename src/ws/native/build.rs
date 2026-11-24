@@ -6,6 +6,7 @@ use std::{
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=src/protocol.rs");
     let output = env::var("OUT_DIR").unwrap();
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
