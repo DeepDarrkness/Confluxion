@@ -9,7 +9,8 @@ extern uint32_t ws_socket_parked(void);
 extern uint32_t ws_socket_fixture_memory(uint64_t, uint64_t*, uint64_t*);
 static Term phase4_settings(Env e, Term *f, IoWork *w) {
   ws_observer_fd = atoi(getenv("WS_OBSERVER_FD") ? getenv("WS_OBSERVER_FD") : "-1");
-  ws_iterations = atoi(getenv("WS_ITERATIONS") ? getenv("WS_ITERATIONS") : "1000000");
+  if (!getenv("WS_ITERATIONS")) { fprintf(stderr,"missing WS_ITERATIONS\n");exit(1); }
+  ws_iterations = atoi(getenv("WS_ITERATIONS"));
   if(getenv("WS_START_FAULT")) ws_socket_fixture_fault(atoi(getenv("WS_START_FAULT")));
   if (atoi(getenv("WS_MODE")) == 1) ws_socket_fixture_buffer(16384);
    if(ws_iterations>=22&&ws_iterations<=23)ws_socket_fixture_buffer(16384);

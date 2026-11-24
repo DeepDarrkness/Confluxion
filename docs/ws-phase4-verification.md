@@ -2,7 +2,7 @@
 
 Phase 4 connects real Bend message producers and consumers to the qualified Rust socket worker. Application bytes cross native effects without moving socket ownership onto Bend's event loop.
 
-Status is **Passed**. The main-checkout `cargo test --release --locked` invocation passed all routine gates for Phases 0 through 4 after implementation review and corrections. The [integration qualification](#integration-qualification) records the final evidence. Earlier focused results below describe development runs.
+Status is **Passed**. The [integration qualification](#integration-qualification) records the completed gate. Routine test selection is documented in the [phase plan](ws-phased-plan.md#phase-scoped-test-selection).
 
 ## Implemented boundary
 
@@ -38,17 +38,7 @@ The lifecycle loop restores a fresh checkpoint of two Bend blocks and 32 bytes a
 
 `tests/ws/phase4.rs` uses the existing Cargo, prepared Bend 2.0.40, marked Rust static archive, and clang pipeline. It emits and instruments actual Bend C, asserts exact compiler anchors, and checks the fresh ELF. Optimized ownership builds use `-O2`. ASan and UBSan use the pinned runtime's required `-O0`. Rust allocations are intercepted; Rust code is not compiler-sanitizer-instrumented.
 
-The focused command is:
-
-```sh
-WS_CACHE=/home/narasimhaai/projects/Confluxion/.ws-cache cargo test --release --locked --test phase4 -- --nocapture
-```
-
-Build products and qualification artifacts stay under the isolated worktree. The shared cache supplies read-only prepared inputs.
-
-The final focused qualification passed in 88.52 seconds after test cleanup. Its manifest is `results/ws/cargo-1795519394432071647-149256/phase-4/summary.json` under `/tmp/opencode/confluxion-ws-phase4`. The manifest has `pass: true`. It records a 140,874,271 ns pure interval, native send at 23,444,292,185,928 ns, native receipt at 23,444,292,299,863 ns, and peer validation at 23,444,292,240,150 ns. The runtime interval starts at 23,444,240,786,836 ns and ends at 23,444,381,661,107 ns. These are correlated host monotonic timestamps, not throughput measurements.
-
-The temporary development-only case selector and unused debug output were removed before this final run. The lead's complete-suite run will verify the integration checkout.
+The routine and ignored full profiles share the same fixture and validators. Routine runs use focused ownership cases, six pauses, eight lifecycle cycles, and 4,096 messages each direction. Bulk boundaries and sanitizers run only in the full profile, which retains the complete gate below. Each summary records its scope and configured counts. A routine pass is not a new million-message qualification.
 
 | Gate | Executed evidence |
 | --- | --- |
@@ -67,37 +57,13 @@ The temporary development-only case selector and unused debug output were remove
 | Corruption and duplicates | Four finite real-path controls detect outgoing and incoming corruption and duplicate identity 1. Outbound faults are generated in Bend and checked by the peer. Inbound faults fail Bend's validator. |
 | Conversion and effects | `diagnostics` records separate native-take, byte-to-Bend conversion, and effect-dispatch time with actual message counts. These overlapping accumulated costs are diagnostics, not additive end-to-end time or throughput qualification. |
 
-The integration section below links the final main-checkout artifacts. Earlier emitted sources, binaries, command records, stdout, stderr, and JSON summaries remain under `results/ws/cargo-*/phase-4` in the implementation worktree.
-
-## Preceding gates and cleanup
-
-Focused Phase 1 and Phase 2 tests passed with the relocated loopback fixture. Phase 3's native correctness gate passed after the worker changes and optional adapter removal. The integration section records the subsequent complete main-checkout pass.
-
-The temporary Autobahn adapter, ignored runner, and adapter-only report reader were removed from `tests/ws/phase3.rs`. Historical Phase 3 reports and frozen profile pins remain unchanged. The lead removed `.ws-cache/autobahn` and `.ws-cache/autobahn-runtime` after the integration pass.
-
-## Design adjustments
-
-Binary outbound lists, numeric incoming kind codes, and an empty protocol string preserve the existing operation shape without adding text-send scope. The compiler flattens nested singleton record fields, so the C adapter packs the observed constructor arities explicitly.
-
-The million-message uWebSockets peer keeps its existing count-completion exit policy. Separate raw-socket finite peers qualify clean shutdown and retained leases. Pause, lifecycle, and fault records use finite connections rather than adding modes to the transport protocol. Conversion diagnostics remain fixture instrumentation.
-
-The lead reviewed and integrated the intended files and recorded the complete-suite evidence below. Phase 5 tuning, additional connections, and SpacetimeDB integration remain out of scope.
-
-## Accepted review fixes and follow-up evidence
-
-The follow-up focused command passed in 97.33 seconds:
-
-```sh
-WS_CACHE=/home/narasimhaai/projects/Confluxion/.ws-cache cargo test --release --locked --test phase4 -- --nocapture
-```
-
-The manifest is `results/ws/cargo-1795519976279072580-153847/phase-4/summary.json` in the isolated worktree. Its `pass` value is `true`. The run includes the existing million-message, pure-computation, 100-pause, fault, boundary, and 1,000-cycle gates. Both ownership and ASan/UBSan builds execute the new finite cases. The first follow-up attempt stopped at Bend emission because two new binders required `+`. The corrected run passed. Historical results above remain unchanged.
+## Additional boundary checks
 
 ### Close retirement and delayed startup
 
 `ws_stop_more` keeps its consumed capability until `ws_socket_stop_finish` retires the registry entry. Expiration of the first C poll does not return a terminal failure while native shutdown remains pending. The worker retains its existing deadline and sole socket ownership. The registry keeps the borrowed notification fd alive until the wait continuation finishes. No helper or reaper thread was added.
 
-`adverse-lifecycle.stdout` records a successful close in **906,131,329 ns**. The sanitizer case records **905,530,794 ns**. Both restore native allocations to zero and fds, threads, and C allocations to their measured baselines before process exit. The peer receives the outgoing bytes and Close, then withholds its Close reply for 1,200 ms. The checks require native retirement within two seconds.
+The withheld-close cases restore native allocations to zero and fds, threads, and C allocations to their measured baselines before process exit. The peer receives the outgoing bytes and Close, then withholds its Close reply for 1,200 ms. The checks require native retirement within two seconds.
 
 The emitted fixture shortens only the first C close poll to 1 ms. The native close deadline remains unchanged. `legacy-close.c` restores the previous early-return branch as an executable negative control. `legacy-close-control.stderr` contains `check tag 19: 9 != 0`. The fixed binary passes the same case and releases its detached receive lease after close.
 
@@ -119,11 +85,9 @@ The new receive instrumentation checks the intercepted high-water mark against `
 
 The pinned Bend 2.0.40 CPU runtime does not provide recoverable allocation failure. In the emitted `original.c`, `heap_alloc_miss` calls `err_post` on exhaustion. The host `err_post` calls `err_fail`, which invokes `_exit(1)`. Host `err_peek` is false because `DEVICE` is false. An actual CPU allocation failure therefore terminates the process before adapter cleanup can run. OS process cleanup releases its resources. No unwind, transactional rollback, or executable recoverable-OOM claim is made. The post-construction check covers only errors that return to the adapter.
 
-At the end of the follow-up delegate run, the complete Cargo suite was pending and phase status was In progress. The subsequent integration run below passed.
-
 ## Integration qualification
 
-The main-checkout suite passed November 24, 2026 with the installed compiler paths:
+The main-checkout cumulative suite passed November 24, 2026, before phase-scoped selection was introduced. That historical invocation used the installed compiler paths:
 
 ```sh
 CLANG=/usr/lib/llvm-19/bin/clang \
@@ -132,7 +96,7 @@ LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/13 \
 cargo test --release --locked
 ```
 
-The initial invocation stopped before Phase 0 fixtures because `clang` was absent from `PATH`. Subsequent preparation checks identified missing default C++ header and library paths. The environment above selects the installed GCC 13 files through the existing compiler overrides. No test gate was changed for those failures.
+The environment above selects installed GCC 13 headers and libraries through the existing compiler overrides. Current routine and explicit qualification commands are in the [phase plan](ws-phased-plan.md#phase-scoped-test-selection).
 
 | Gate | Result | Final evidence |
 | --- | --- | --- |
@@ -147,3 +111,9 @@ Each Cargo target passed its single integration test, with zero failures or igno
 The final Phase 4 manifest records 1,000,000 validated messages each direction, including 250,000 singles and 750,000 batch messages. Its pure interval lasts **138,153,864 ns**, with zero intervening effect dispatches. The measured runtime interval is 24,797,506,451,052 through 24,797,644,604,916 ns. Native complete-send, native complete-receive, and peer-validation timestamps are 24,797,560,226,156, 24,797,560,313,941, and 24,797,560,280,851 ns respectively. All three lie strictly inside that interval. Bend subsequently validates and consumes the received identity.
 
 Both instrumentation modes pass 1,000 real socket lifecycle cycles. The final run also passes the 100 finite receiver pauses, persistent receive-saturation cycles, connected-idle and peak bounds, fault controls, delayed startup, and withheld-close retirement. The optional Autobahn adapter and temporary runtime are removed; recorded Phase 3 evidence is preserved. No Phase 5 throughput qualification is claimed.
+
+## Phase-scoped routine check
+
+After phase selection was introduced, `cargo test --release --locked -- --nocapture` ran only Phase 4 routine checks and passed in 28.26 seconds, with the full qualification ignored. Its [summary](../results/ws/cargo-1795522087189929667-171377/phase-4/summary.json) records `scope: routine`, 4,096 messages each direction, six pauses, eight ownership lifecycle cycles, and `sanitizers: false`.
+
+Phase 2 was explicitly selected to verify protocol-suite availability after manifest changes. Phase 1 was selected because native archive selection changed. Both passed. Phases 0 and 3 and full Phase 4 qualification were not rerun for this test-policy change. The full test remains explicitly selectable; its recorded qualification above remains historical evidence.

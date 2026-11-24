@@ -11,7 +11,7 @@ Confluxion is an event-sourced, reactive backend built on SpacetimeDB and Bend.
 - [Connector feasibility](spacetime-bend.md) assesses external Bend execution and event-sourced projections.
 - [CQRS and platform reuse](spacetime-bend-cqrs.md) covers subscriptions, generation, frontend integration, and CLI reuse.
 - [Performance analysis](spacetime-bend-performance.md) traces costs and measurement requirements.
-- [Agent guidelines](AGENTS.md) records the project's Bend resources and Markdown conventions.
+- [Agent guidelines](../AGENTS.md) records the project's Bend resources, phase-scoped testing policy, and Markdown conventions.
 
 The reports record source research from November 17, 2026. They use different source revisions, so the WebSocket version target needs confirmation before implementation.
 

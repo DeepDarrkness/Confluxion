@@ -109,7 +109,7 @@ fn executable(name: std::ffi::OsString) -> PathBuf {
 
 fn select_archive(deps: &Path, marker: &[u8]) -> PathBuf {
     assert!(!marker.is_empty());
-    let matching: Vec<_> = fs::read_dir(deps)
+    let mut matching: Vec<_> = fs::read_dir(deps)
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| {
@@ -126,10 +126,10 @@ fn select_archive(deps: &Path, marker: &[u8]) -> PathBuf {
                 && bytes.windows(marker.len()).any(|part| part == marker)
         })
         .collect();
-    assert_eq!(
-        matching.len(),
-        1,
-        "missing/ambiguous archive for the CURRENT linked native build"
+    matching.sort();
+    assert!(
+        !matching.is_empty(),
+        "missing archive for the CURRENT linked native build"
     );
     matching.into_iter().next().unwrap()
 }

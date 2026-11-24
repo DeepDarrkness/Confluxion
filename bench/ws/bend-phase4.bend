@@ -167,39 +167,39 @@ def received_batch(pair: WS.Session & WS.BatchReceive, sequence: U32) -> IO(WS.S
       do IO<WS.Session>:
         check(code, 0, 18)
         return s
-@unsafe def pump(s: WS.Session, c: WS.Closer, +tx: U32, +rx: U32) -> IO(Unit):
-  pump_progress(U32.is_eq((tx % 10000 : U32), 0), s, c, tx, rx)
-@unsafe def pump_progress(progress: Bool, s: WS.Session, c: WS.Closer, +tx: U32, +rx: U32) -> IO(Unit):
+@unsafe def pump(s: WS.Session, c: WS.Closer, +tx: U32, +rx: U32, total: U32, single_cutoff: U32) -> IO(Unit):
+  pump_progress(U32.is_eq((tx % 10000 : U32), 0), s, c, tx, rx, total, single_cutoff)
+@unsafe def pump_progress(progress: Bool, s: WS.Session, c: WS.Closer, +tx: U32, +rx: U32, +total: U32, single_cutoff: U32) -> IO(Unit):
   match progress:
     case True{}:
       do IO<Unit>:
         s1 : WS.Session <- report_session(s, 9, tx, rx)
-        pump_done(U32.is_eq(tx, 1000000) && U32.is_eq(rx, 1000000), s1, c, tx, rx)
+        pump_done(U32.is_eq(tx, total) && U32.is_eq(rx, total), s1, c, tx, rx, total, single_cutoff)
     case False{}:
-      pump_done(U32.is_eq(tx, 1000000) && U32.is_eq(rx, 1000000), s, c, tx, rx)
-@unsafe def pump_done(done: Bool, s: WS.Session, c: WS.Closer, +tx: U32, +rx: U32) -> IO(Unit):
+      pump_done(U32.is_eq(tx, total) && U32.is_eq(rx, total), s, c, tx, rx, total, single_cutoff)
+@unsafe def pump_done(done: Bool, s: WS.Session, c: WS.Closer, +tx: U32, +rx: U32, +total: U32, +single_cutoff: U32) -> IO(Unit):
   match done:
     case True{}:
       finish(s, c, tx, rx)
     case False{}:
       do IO<Unit>:
-        sent : WS.Session & U32 <- pump_send((tx < 1000000 : U32), s, tx)
-        pump_sent(sent, c, rx)
-@unsafe def pump_received(pair: WS.Session & U32, c: WS.Closer, tx: U32) -> IO(Unit):
+        sent : WS.Session & U32 <- pump_send((tx < total : U32), s, tx, total, single_cutoff)
+        pump_sent(sent, c, rx, total, single_cutoff)
+@unsafe def pump_received(pair: WS.Session & U32, c: WS.Closer, tx: U32, total: U32, single_cutoff: U32) -> IO(Unit):
   (s, rx) = pair
-  pump(s, c, tx, rx)
-@unsafe def pump_sent(pair: WS.Session & U32, c: WS.Closer, +rx: U32) -> IO(Unit):
+  pump(s, c, tx, rx, total, single_cutoff)
+@unsafe def pump_sent(pair: WS.Session & U32, c: WS.Closer, +rx: U32, total: U32, +single_cutoff: U32) -> IO(Unit):
   (s, tx) = pair
   do IO<Unit>:
-    recv : WS.Session & U32 <- pump_receive((rx < 250000 : U32), s, rx)
-    pump_received(recv, c, tx)
-@unsafe def pump_send(active: Bool, s: WS.Session, +tx: U32) -> IO(WS.Session & U32):
+    recv : WS.Session & U32 <- pump_receive((rx < single_cutoff : U32), s, rx)
+    pump_received(recv, c, tx, total, single_cutoff)
+@unsafe def pump_send(active: Bool, s: WS.Session, +tx: U32, total: U32, single_cutoff: U32) -> IO(WS.Session & U32):
   match active:
     case False{}:
       IO.pure(WS.Session & U32, (s, tx))
     case True{}:
-      pump_send_size((tx < 250000 : U32), s, tx)
-def pump_send_size(single: Bool, s: WS.Session, +tx: U32) -> IO(WS.Session & U32):
+      pump_send_size((tx < single_cutoff : U32), s, tx, total)
+def pump_send_size(single: Bool, s: WS.Session, +tx: U32, total: U32) -> IO(WS.Session & U32):
   match single:
     case True{}:
       do IO<WS.Session & U32>:
@@ -207,7 +207,7 @@ def pump_send_size(single: Bool, s: WS.Session, +tx: U32) -> IO(WS.Session & U32
         return (s1, (tx + 1 : U32))
     case False{}:
       do IO<WS.Session & U32>:
-        +count : U32 = U32.min(32, (1000000 - tx : U32))
+        +count : U32 = U32.min(32, (total - tx : U32))
         s1 : WS.Session <- send_batch(s, batch(U32.to_nat(count), tx), count)
         return (s1, (tx + count : U32))
 def pump_receive(single: Bool, s: WS.Session, rx: U32) -> IO(WS.Session & U32):
@@ -319,10 +319,10 @@ def startup_failure(failure: Bool) -> U32:
       9
     case False{}:
       0
-@unsafe def choose_mode(million: Bool, s: WS.Session, c: WS.Closer, +iterations: U32) -> IO(Unit):
-  match million:
+@unsafe def choose_mode(transfer: Bool, s: WS.Session, c: WS.Closer, +iterations: U32) -> IO(Unit):
+  match transfer:
     case True{}:
-      pump(s, c, 0, 0)
+      pump(s, c, 0, 0, iterations, (iterations / 4 : U32))
     case False{}:
       choose_finite((iterations < 1000 : U32), s, c, iterations)
 @unsafe def choose_finite(qualification: Bool, s: WS.Session, c: WS.Closer, iterations: U32) -> IO(Unit):

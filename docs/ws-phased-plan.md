@@ -49,18 +49,47 @@ Each Phase 0 invocation writes `results/ws/cargo-<run-id>/phase-0/summary.json`,
 
 ## Testing dependency policy
 
-Routine testing uses `cargo test --release --locked` and Cargo's native Rust test runner. Clang is the only additional native fixture compiler to install in the deployed test runner. The pinned Bend compiler and prepared reference sources remain build inputs. Routine tests require no Python runtime, Autobahn installation, Docker, or separate test framework.
+Routine testing uses `cargo test --release --locked` and Cargo's native Rust test runner. The default is the current phase's short correctness suite. Earlier phases are optional and selected when changed code touches their tested boundaries. Clang and prepared Bend/reference sources remain build inputs. Routine tests require no Python runtime, Autobahn installation, Docker, or separate test framework.
 
 Autobahn's Python dependency is temporary protocol-qualification tooling, not a library or deployment dependency. Phase 3 conformance has already passed. Phase 4 removes the optional adapter and ignored Cargo test after focused real Bend qualification. Phases 4 onward do not require Autobahn unless a concrete protocol change requires renewed conformance, such as a protocol-library upgrade or changed handshake, framing, control, or UTF-8 behavior. Routine queue, Bend-effect, throughput, and computation-pool checks stay on the Rust and clang path.
 
 Phase 4 qualification removed the temporary Autobahn Python runtime and optional test adapter. The recorded Phase 3 case reports remain as evidence. Later conformance work can use separately provisioned tooling if a concrete protocol change requires it. Earlier-phase correctness reruns in this plan mean the routine Cargo checks; they do not automatically reinstall or rerun Autobahn.
+
+### Phase-scoped test selection
+
+Each Cargo integration target requires its matching `phase0` through `phase4` feature. The features are independent. `phase4` is currently the default; selecting a phase does not automatically select its predecessors. Update the default feature when implementation advances to a new phase.
+
+```sh
+# Current phase, routine correctness
+cargo test --release --locked
+
+# Specific earlier dependencies, example: ownership and protocol
+cargo test --release --locked -p ws-reference --no-default-features --features phase1,phase2
+
+# Current phase plus a changed native worker dependency
+cargo test --release --locked -p ws-reference --features phase3
+
+# Explicit complete Phase 4 qualification
+cargo test --release --locked -p ws-reference --test phase4 phase4_full_qualification -- --ignored --exact --test-threads=1
+```
+
+For a single selected target, add `--test phaseN` and enable its feature. Disabled targets are not compiled or executed. `--all-features` opts into all earlier suites. Run ignored qualification tests separately from routine checks.
+
+| Changed boundary | Optional earlier coverage |
+| --- | --- |
+| Compiler, native build, reference integrity, or evidence validation | Phase 0 |
+| Capability handles, lease ownership, allocation accounting, release, or shutdown ownership | Phase 1 |
+| Handshake, framing, UTF-8, configured limits, or partial-write adapter | Phase 2 |
+| Socket scheduling, queue admission, controls, duplex progress, or directional deadlines | Phase 3 |
+
+Choose only the earlier suites relevant to the diff and record that choice. Implementation dependencies do not impose an automatic cumulative test run. Phase 4 routine checks transfer 4,096 messages each direction, including 1,024 singles and 3,072 batch messages, and run six receiver pauses and eight ownership lifecycle cycles. They retain focused fault, boundary, lease, saturation, and effect-free computation checks. Sanitizers and bulk-boundary campaigns run only in the ignored full qualification, alongside one million messages each way, 100 pauses, and 1,000 lifecycle cycles per instrumentation mode. Routine evidence is labeled `routine`; it does not replace full phase qualification evidence.
 
 ## Phase 0. Establish native builds and reference correctness
 
 - Outcome: reproducible native builds and a small correctness suite that cannot mistake enqueueing for delivered work.
 - Owns: the root Cargo workspace, `bench/ws/`, and the native integration test in `tests/ws/`. Depends on no implementation phase.
 - Smallest unit: select the Bend pin and compatible native compiler, build optimized reference client and peer adapters, then run two separate processes on loopback. Use length-delimited TCP for reference-bound checks. Pin actual dependencies; defer Autobahn setup until Phase 3 needs it.
-- Verification: `cargo test --release --locked`. The command also compiles and runs a minimal native Bend program with clang, establishing that the chosen compiler works before phase 1.
+- Verification: `cargo test --release --locked -p ws-reference --no-default-features --features phase0 --test phase0`. The command also compiles and runs a minimal native Bend program with clang, establishing that the chosen compiler works before phase 1.
 - Gate: a fresh native Bend ELF and exact reference vectors pass. Receiver counts, sequence IDs, and every payload byte agree for one million messages in each direction. Four duplicate and corruption controls fail at the exact injected identity. Four paused-receiver trials prove bounded rejection and drainage over WebSocket and TCP. Damaged real evidence cannot pass. One native Rust integration test owns all results.
 - Stop: a missing compiler, count or identity mismatch, incorrect fault result, breached resource bound, or missing evidence fails the suite. This revised Phase 0 does not qualify noise, sustained headroom, latency, or throughput.
 
@@ -71,7 +100,7 @@ The user removed the original long benchmark gate to keep testing minimalist. Hi
 - Outcome: Bend can safely own a persistent Rust worker service and exchange bounded byte payloads through the actual effect ABI.
 - Owns: minimal `src/ws/main.bend`, `src/ws/effects/`, the Rust static library and private C ABI, native resource lifecycle, and lifecycle fixtures. Depends on phase 0.
 - Smallest unit: link the Rust static library through the C effect adapter and use an in-memory native queue and wake mechanism, without WebSocket framing. Validate the session capability accepted by the pinned compiler. Keep Rust-owned byte storage separate from Bend terms; construct Bend values only on the runtime thread. Define copy, admission, and release ownership and contain Rust panics at the C boundary.
-- Verification: extend `cargo test --release --locked` with the real Bend ownership fixture, not a C-only simulation.
+- Verification: select `--no-default-features --features phase1 --test phase1` with `cargo test --release --locked`. The real Bend ownership fixture supplies the gate, not a C-only simulation.
 - Gate: 1,000 start/transfer/release/close cycles leave zero client-owned live native allocations, descriptors, or helper threads after each cycle and restore the measured Bend runtime baseline. Empty/full queue admission, failed startup, stale generations, repeated shutdown, and close with a waiting receiver have defined results. Native-thread joins finish within one second after close initiation in this fixture. The ownership/fault suite passes with native memory instrumentation and sanitizers where the selected compiler supports them.
 - Stop: an unusable handle representation, off-thread Bend heap access, lost wakeup, or unresolved leak blocks framing work. Revise the effect representation and rerun this same gate before building callers around it.
 
@@ -92,7 +121,7 @@ Subsequent cleanup removed upstream-only parser probes, repeated admission and i
 - Outcome: configured Tungstenite behavior preserves correct wire messages independently of Bend application logic.
 - Owns: Tungstenite configuration, handshake/subprotocol policy, IO adapter, and integration fixtures in `tests/ws/`. Depends on phase 1's resource and buffer representation.
 - Smallest unit: use the pinned Tungstenite implementation for upgrade, incremental framing, masks, fragmentation, UTF-8, controls, and close. Configure frame, message, read-buffer, and write-buffer limits. Test the actual adapter with prepared read/write sources before real networking; do not copy or fork the protocol core.
-- Verification: extend `cargo test --release --locked` with behavior-focused checks for the configured protocol adapter. Upstream tests are references, not a substitute for testing our integration.
+- Verification: select `--no-default-features --features phase2 --test phase2` with `cargo test --release --locked`. Upstream tests are references, not a substitute for testing our integration.
 - Gate: RFC accept vectors and negative upgrades pass; header splits are tested at every byte boundary; small frame fixtures are split at every boundary and larger frames use seeded random splits. Preserve a data frame coalesced with the upgrade response. Cover lengths 0, 125, 126, 65,535, and 65,536, configured limits, malformed lengths/opcodes/masks, fragmented UTF-8, Ping/Pong, and Close. Decode emitted frames with an independent reference and test the reverse direction; another Tungstenite instance alone is not independent evidence. Force one-to-seven-byte writes alternating with `WouldBlock`; the collected wire bytes must match the expected frame sequence exactly. Admission bounds apply before enqueueing, configured limits reject excess data, and dependency allocations count toward the derived native memory budget.
 - Stop: a missing required integration case, changed message boundary, duplicate accepted frame, or incorrect partial-write suffix blocks socket integration. Keep codec timing as a diagnostic; self-roundtrip speed is not a release gate. The dependency retains unsent wire bytes; the adapter must not resubmit accepted messages after `WouldBlock`. [Frame codec][ws-tungstenite-frame]
 
@@ -111,19 +140,17 @@ Completed November 24, 2026. The [qualification report](ws-phase3-verification.m
 
 Completed November 24, 2026. The [integration qualification](ws-phase4-verification.md#integration-qualification) records the public API, ownership bounds, measured computation interval, independent receipt, and full Cargo rerun. All routine gates for Phases 0 through 4 passed in the main checkout.
 
-Implementation is in progress. The [Phase 4 verification record](ws-phase4-verification.md) describes the real socket API and focused qualification. Final integration review and the complete Cargo suite remain pending.
-
 - Outcome: application bytes travel from a real Bend producer to the peer and from the peer to a real Bend consumer, while socket work remains independent of computation.
 - Owns: `src/ws/main.bend`, `src/ws/effects/`, and `bench/ws/bend-*` fixtures. Depends on phase 3.
 - Smallest unit: expose connect, bounded send admission, receive, explicit buffer release, status, and close. Add batched send/receive with count and byte limits. Distinguish not-admitted messages from accepted messages that are still buffered. Keep this API independent of BSATN and SpacetimeDB.
-- Verification: extend `cargo test --release --locked` with the real Bend message path.
+- Verification: `cargo test --release --locked` runs the short real Bend message path. Select `phase4_full_qualification` with `--ignored --exact` for the complete gate described below.
 - Gate: the real Bend path preserves payloads and message boundaries for at least one million messages each direction, including batched and unbatched transfer. Run a pure Bend computation whose measured effect-free interval is at least 100 ms. During that interval, prove native receipt through worker counters and send a previously queued result that the external peer validates before computation ends. Record runtime-boundary, worker-send, worker-receive, and peer-receipt timestamps; transport events must occur inside the effect-free interval, not before it. Exercise Ping/Pong and check phase 3's eligible-control service budget. Pause each receiver in turn; opposite-direction traffic must progress, memory stays bounded, and resumed consumption drains retained messages exactly once. Shutdown retains phase 1's resource guarantees.
 - Stop: a C-only result, computation eliminated by optimization, receipt demonstrated only by kernel buffering, or accepted-but-not-consumed payload is insufficient evidence. Benchmark the native byte-to-Bend conversion and effects separately to locate costs before tuning.
 
 ## Phase 5. Tune and qualify local message throughput
 
 - Outcome: the standalone library meets explicit throughput, latency, and memory targets on the frozen local profile.
-- Owns: transport batching, buffer reuse, effect batching, and `bench/ws/` measurement adapters. Depends on phase 4; rerun earlier correctness gates after each change.
+- Owns: transport batching, buffer reuse, effect batching, and `bench/ws/` measurement adapters. Depends on phase 4; select earlier correctness suites only for boundaries affected by a change.
 - Smallest unit: change one measured limiter at a time. Compare immediate writes with bounded batches; compare reusable buffers and transfer representations; coalesce wakeups where correct. Preserve WebSocket message boundaries when batching writes. Do not merge application records into one message to inflate messages/second.
 - Verification: extend the Cargo suite with real Phase 5 checks and a separately frozen performance profile. No performance controller remains in revised Phase 0.
 - Gate: first qualify references with five paired trials per W1 and W2 core workload, 10 seconds of warmup, and 60 seconds of measurement. Reference throughput spread must be at most 5% of its median, and the generator and peer must sustain at least 1.25 times the chosen operating rate. Then median native capacity must be at least 80% of the equivalently configured Tungstenite client capacity against the same peer. Median full Bend-path capacity must be at least 80% of our native-only capacity. Each paired ratio must be at least 75%. At half the lower of the compared capacities, native scheduled-send-to-peer-receipt p99 is at most 1 ms and Bend scheduled-producer-to-application-consumer p99 is at most 2 ms, excluding job computation. Five 60-second trials pass with zero unexpected rejection, deadline expiry, integrity failure, or growing queue backlog. W4 overload and W5 soak must also pass.
@@ -134,7 +161,7 @@ Implementation is in progress. The [Phase 4 verification record](ws-phase4-verif
 - Outcome: a local example reuses a configured number of BendRT processes and completes correlated jobs without breaking transport limits.
 - Owns: `examples/ws-worker-pool/` and compute workloads in `bench/ws/`. Depends on phase 5. Pool scheduling and application job IDs remain outside `src/ws/`.
 - Smallest unit: start with one process, a bounded job queue, and a deterministic computation with validated results. Add two and four processes only when machine capacity permits. Bound active jobs and reserve completed-result capacity before admitting work. Configure process count and CPU threads per process together.
-- Verification: extend `cargo test --release --locked` with pool checks and rerun all preceding real gates.
+- Verification: extend the Cargo suite with pool checks and select earlier suites for changed transport, ownership, or build boundaries.
 - Gate: W3 and W4 never exceed configured process, queued-job, active-job, or result-byte limits; no worker is created per request. Normal W3 capacity and latency trials require exactly one validated successful result per admitted job and zero unexpected terminal failures. Fault-injection trials require exactly one terminal outcome per admitted job, matched to its injected fault. Failed and unfinished jobs remain visible in qualification results. Job IDs correlate variable-duration and out-of-order completion, while a partitioned fixture preserves its declared ordering. At 50% of the measured fixed-pool compute capacity, job p99 is no more than the matching compute-only p99 plus 2 ms. Both trials use identical scheduled arrivals, input order, queue limits, scheduling policy, process count, and thread budgets; both measure from scheduled job arrival until the benchmark coordinator validates its result. The compute-only path bypasses the WebSocket adapter using the reference local test channel; pure computation duration is reported separately. In a mixed long/short-job test, independent worker processes make observable progress while one runs a long job. At a scheduled job rate of 70% of compute-only capacity, transport p99 stays within phase 5's 2 ms budget on eligible unsaturated traffic. Shutdown completes within the configured drain deadline plus one second and leaves no child or native worker behind.
 - Stop: arithmetic results without verified execution, unbounded spawning, duplicate dispatch, broken ordering, or CPU oversubscription blocks pool readiness. More processes need not increase throughput when one job already uses the machine's CPU/GPU capacity. Report process-count results rather than require a fabricated linear speedup.
 
@@ -206,7 +233,7 @@ A correctness fixture deliberately injects faults, but a capacity trial must hav
 
 ## Phase completion and later connector work
 
-Each phase reruns preceding load-bearing correctness checks before proceeding. No phase passes from an agent's summary, a successful `send`, or a self-roundtrip alone. The verifier must read the actual peer results, resource counters, and case-level failures. Missing evidence is a failed or inconclusive gate.
+Each change runs the current phase's relevant checks and selects older suites only for affected dependencies. Full qualification runs explicitly when qualifying a phase or when changed behavior invalidates its recorded gate. No phase passes from an agent's summary, a successful `send`, or a self-roundtrip alone. The verifier must read the actual peer results, resource counters, and case-level failures. Missing evidence is a failed or inconclusive gate.
 
 Phase 5 qualifies standalone transport performance. Phase 6 qualifies its bounded computation-pool example. The SpacetimeDB delivery track begins after Phase 4 and must independently confirm a reducer call, persistent subscription, atomic updates, and uncertain-commit recovery. Those checks cannot be inferred from a synthetic job peer. Optional Phase 7 changes only the transport implementation after the Rust-backed connector is reliable.
 

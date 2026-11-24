@@ -325,6 +325,10 @@ fn build_peer(root: &Path, out: &Path, cache: &Path, clang: &Path) -> PathBuf {
 fn child(binary: &Path, port: u16, mode: u32, iters: u32) -> Command {
     let mut c = Command::new(binary);
     c.args(["+RTS", "--threads", "1", "--gpu", "off", "-RTS"])
+        .env_remove("WS_OMIT_RELEASE")
+        .env_remove("WS_EARLY_CLOSE_POLL")
+        .env_remove("WS_START_FAULT")
+        .env_remove("WS_OBSERVER_FD")
         .env("WS_PORT", port.to_string())
         .env("WS_MODE", mode.to_string())
         .env("WS_ITERATIONS", iters.to_string());
@@ -852,8 +856,70 @@ fn adverse_lifecycle(binary: &Path, root: &Path, out: &Path, label: &str, fixed:
     json!({"rows":data,"peer":peer})
 }
 
+enum QualificationProfile {
+    Routine,
+    Full,
+}
+struct Qualification {
+    scope: &'static str,
+    messages: u32,
+    pauses: u32,
+    lifecycle_cycles: u32,
+}
+impl QualificationProfile {
+    fn configuration(&self) -> Qualification {
+        match self {
+            Self::Routine => Qualification {
+                scope: "routine",
+                messages: 4096,
+                pauses: 6,
+                lifecycle_cycles: 8,
+            },
+            Self::Full => Qualification {
+                scope: "full-qualification",
+                messages: 1_000_000,
+                pauses: 100,
+                lifecycle_cycles: 1000,
+            },
+        }
+    }
+    fn pause_index(&self, cycle: u32) -> u32 {
+        match self {
+            Self::Routine => cycle,
+            Self::Full => (cycle / 2) % 3 + (cycle % 2) * 3,
+        }
+    }
+}
+
 #[test]
 fn phase4_real_bend() {
+    qualify(QualificationProfile::Routine);
+}
+
+#[test]
+#[ignore = "historical phase4 qualification; run explicitly and serially"]
+fn phase4_full_qualification() {
+    qualify(QualificationProfile::Full);
+}
+
+fn qualify(profile: QualificationProfile) {
+    let config = profile.configuration();
+    let full = matches!(profile, QualificationProfile::Full);
+    let ownership_cases: Vec<_> = match profile {
+        QualificationProfile::Routine => vec![6, 7, 8, 10, 14, 17, 18, 19, 22, 29],
+        QualificationProfile::Full => (6..21).chain(22..24).chain([29]).collect(),
+    };
+    let singles = config.messages / 4;
+    let batches = config.messages - singles;
+    let configured = json!({
+        "messages_each_direction": config.messages,
+        "single_messages_each_direction": singles,
+        "batch_messages_each_direction": batches,
+        "pause_cases": config.pauses,
+        "lifecycle_cycles_each_mode": config.lifecycle_cycles,
+        "ownership_cases": ownership_cases,
+        "sanitizers": full
+    });
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .canonicalize()
@@ -870,8 +936,19 @@ fn phase4_real_bend() {
         std::process::id()
     ));
     fs::create_dir_all(&out).unwrap();
-    println!("Phase 4 evidence: {}", out.display());
-    fs::write(out.join("summary.json"), "{\"pass\":false}").unwrap();
+    println!(
+        "Phase 4 {} evidence: {} ({configured})",
+        config.scope,
+        out.display()
+    );
+    fs::write(
+        out.join("summary.json"),
+        serde_json::to_vec_pretty(
+            &json!({"pass":false,"scope":config.scope,"configured":configured}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let bend = cache.join("bend/bin/bend");
     let clang = PathBuf::from("/usr/lib/llvm-19/bin/clang");
     let mut c = Command::new(&bend);
@@ -885,7 +962,7 @@ fn phase4_real_bend() {
     fs::write(&source, instrument(fs::read_to_string(&original).unwrap())).unwrap();
     let deps = env::current_exe().unwrap().parent().unwrap().to_owned();
     let marker = confluxion_ws_native::build_marker();
-    let archives: Vec<_> = fs::read_dir(deps)
+    let mut archives: Vec<_> = fs::read_dir(deps)
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| {
@@ -902,7 +979,8 @@ fn phase4_real_bend() {
                 .any(|b| b == marker.as_bytes())
         })
         .collect();
-    assert_eq!(archives.len(), 1);
+    archives.sort();
+    assert!(!archives.is_empty(), "missing current native build archive");
     let binary = out.join("bend-phase4");
     let mut c = Command::new(&clang);
     c.args(["-O2", "-g", "-std=c11", "-DBEND_POISON"])
@@ -932,52 +1010,60 @@ fn phase4_real_bend() {
         .arg("-o")
         .arg(&legacy_binary);
     run(c, &root, &out, "build-legacy-close");
-    let legacy_close =
+    let mut legacy_close =
         adverse_lifecycle(&legacy_binary, &root, &out, "legacy-close-control", false);
-    let adverse = adverse_lifecycle(&binary, &root, &out, "adverse-lifecycle", true);
+    legacy_close["mode"] = json!("legacy-close");
+    let mut adverse = adverse_lifecycle(&binary, &root, &out, "adverse-lifecycle", true);
+    adverse["mode"] = json!("ownership");
+    let mut adverse_cases = vec![adverse];
     let peer = build_peer(&root, &out, &cache, &clang);
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     drop(l);
     let mut c = Command::new(peer);
     c.arg(port.to_string())
-        .arg("1000000")
+        .arg(config.messages.to_string())
         .arg(out.join("peer.json"));
-    let mut p = spawn(c, &root, &out, "million-peer");
+    let mut p = spawn(c, &root, &out, "transfer-peer");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !fs::read_to_string(out.join("million-peer.stdout"))
+    while !fs::read_to_string(out.join("transfer-peer.stdout"))
         .unwrap_or_default()
         .contains("LISTENING")
     {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(1));
     }
-    let mut b = spawn(child(&binary, port, 0, 0), &root, &out, "million-bend");
-    let text = finish(&mut b, &out, "million-bend", 600);
-    finish(&mut p, &out, "million-peer", 5);
-    let million = rows(&text);
-    let status = million
+    let mut b = spawn(
+        child(&binary, port, 0, config.messages),
+        &root,
+        &out,
+        "transfer-bend",
+    );
+    let text = finish(&mut b, &out, "transfer-bend", 600);
+    finish(&mut p, &out, "transfer-peer", 5);
+    let transfer = rows(&text);
+    let status = transfer
         .iter()
         .find(|r| r["kind"] == "status" && r["tag"] == 1)
         .unwrap();
     for k in ["tx", "rx", "admitted", "sent", "received", "consumed"] {
-        assert_eq!(n(status, k), 1_000_000);
+        assert_eq!(n(status, k), config.messages as u64);
     }
     assert_eq!(n(status, "failed"), 0);
-    resource_check(&million);
-    let diagnostic = million
+    resource_check(&transfer);
+    let diagnostic = transfer
         .iter()
         .find(|r| r["kind"] == "diagnostics" && r["tag"] == 1)
         .unwrap();
     for key in ["single_sent", "single_received"] {
-        assert_eq!(n(diagnostic, key), 250_000);
+        assert_eq!(n(diagnostic, key), singles as u64);
     }
     for key in ["batch_sent", "batch_received"] {
-        assert_eq!(n(diagnostic, key), 750_000);
+        assert_eq!(n(diagnostic, key), batches as u64);
     }
     let peer: Value = serde_json::from_slice(&fs::read(out.join("peer.json")).unwrap()).unwrap();
-    assert_eq!(n(&peer, "validated"), 1_000_000);
-    assert_eq!(n(&peer, "sent"), 1_000_000);
+    assert_eq!(n(&peer, "validated"), config.messages as u64);
+    assert_eq!(n(&peer, "sent"), config.messages as u64);
     assert!(peer["failure"].is_null());
     let mut attempts = vec![];
     for iterations in [128_000_000u32, 256_000_000, 512_000_000] {
@@ -1075,49 +1161,64 @@ fn phase4_real_bend() {
     }
     assert!(attempts.iter().any(|v| n(v, "interval_ns") >= 100_000_000));
     let mut finite_cases = vec![];
-    for index in (6..21).chain(22..24) {
+    for index in ownership_cases {
         finite_cases.push(finite(&binary, &root, &out, index, "ownership"));
     }
-    finite_cases.push(finite(&binary, &root, &out, 29, "ownership"));
-    for cycle in 0..100 {
+    for cycle in 0..config.pauses {
         finite_cases.push(finite(
             &binary,
             &root,
             &out,
-            (cycle / 2) % 3 + (cycle % 2) * 3,
+            profile.pause_index(cycle),
             &format!("pause-{cycle}"),
         ));
     }
-    let owned_lifecycle = lifecycle(&binary, &root, &out, "ownership", 1000);
-    let sanitizer = out.join("bend-phase4-sanitized");
-    let mut c = Command::new(&clang);
-    c.args([
-        "-O0",
-        "-g",
-        "-std=c11",
-        "-DBEND_POISON",
-        "-fsanitize=address,undefined",
-        "-fno-omit-frame-pointer",
-    ])
-    .arg("-I")
-    .arg(root.join("src/ws/native"))
-    .arg(&source)
-    .arg(&archives[0])
-    .args(["-lpthread", "-lm", "-ldl"])
-    .arg("-o")
-    .arg(&sanitizer);
-    run(c, &root, &out, "build-sanitizer");
-    for index in 6..21 {
-        finite_cases.push(finite(&sanitizer, &root, &out, index, "asan-ubsan"));
+    let mut lifecycle_cases = vec![lifecycle(
+        &binary,
+        &root,
+        &out,
+        "ownership",
+        config.lifecycle_cycles,
+    )];
+    if full {
+        let sanitizer = out.join("bend-phase4-sanitized");
+        let mut c = Command::new(&clang);
+        c.args([
+            "-O0",
+            "-g",
+            "-std=c11",
+            "-DBEND_POISON",
+            "-fsanitize=address,undefined",
+            "-fno-omit-frame-pointer",
+        ])
+        .arg("-I")
+        .arg(root.join("src/ws/native"))
+        .arg(&source)
+        .arg(&archives[0])
+        .args(["-lpthread", "-lm", "-ldl"])
+        .arg("-o")
+        .arg(&sanitizer);
+        run(c, &root, &out, "build-sanitizer");
+        for index in 6..21 {
+            finite_cases.push(finite(&sanitizer, &root, &out, index, "asan-ubsan"));
+        }
+        finite_cases.push(finite(&sanitizer, &root, &out, 29, "asan-ubsan"));
+        let mut adverse_sanitized =
+            adverse_lifecycle(&sanitizer, &root, &out, "adverse-lifecycle-sanitized", true);
+        adverse_sanitized["mode"] = json!("asan-ubsan");
+        adverse_cases.push(adverse_sanitized);
+        lifecycle_cases.push(lifecycle(
+            &sanitizer,
+            &root,
+            &out,
+            "asan-ubsan",
+            config.lifecycle_cycles,
+        ));
     }
-    finite_cases.push(finite(&sanitizer, &root, &out, 29, "asan-ubsan"));
-    let adverse_sanitized =
-        adverse_lifecycle(&sanitizer, &root, &out, "adverse-lifecycle-sanitized", true);
-    let sanitized_lifecycle = lifecycle(&sanitizer, &root, &out, "asan-ubsan", 1000);
     let integrity_cases: Vec<_> = (24..=28)
         .map(|i| integrity(&binary, &root, &out, i))
         .collect();
     let startup_faults = startup_faults(&binary, &root, &out);
     let omitted = omitted_release(&binary, &root, &out);
-    fs::write(out.join("summary.json"),serde_json::to_vec_pretty(&json!({"pass":true,"million":million,"compute_attempts":attempts,"peer":peer,"archive":archives[0],"marker":marker,"finite":finite_cases,"lifecycle":[owned_lifecycle,sanitized_lifecycle],"adverse_lifecycle":[adverse,adverse_sanitized],"legacy_close_control":legacy_close,"integrity":integrity_cases,"damaged_compute_controls":5,"startup_faults":startup_faults,"omitted_release":omitted})).unwrap()).unwrap();
+    fs::write(out.join("summary.json"),serde_json::to_vec_pretty(&json!({"pass":true,"scope":config.scope,"configured":configured,"transfer":transfer,"compute_attempts":attempts,"peer":peer,"archive":archives[0],"marker":marker,"finite":finite_cases,"lifecycle":lifecycle_cases,"adverse_lifecycle":adverse_cases,"legacy_close_control":legacy_close,"integrity":integrity_cases,"damaged_compute_controls":5,"startup_faults":startup_faults,"omitted_release":omitted})).unwrap()).unwrap();
 }

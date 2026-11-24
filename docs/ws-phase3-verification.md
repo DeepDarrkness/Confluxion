@@ -79,27 +79,16 @@ The [conformance results](../results/ws/cargo-1795512093612704375-99189/phase-3/
 
 The full Cargo invocation passed [Phase 0](../results/ws/cargo-1795511886178421683-94105/phase-0/summary.json), [Phase 1](../results/ws/cargo-1795511931031429310-94265/phase-1/summary.json), and [Phase 2](../results/ws/cargo-1795511937858175300-97357/phase-2/summary.json) against the final native implementation. Phase 3 then needed report-reader and fixture-policy corrections. The final focused Phase 3 invocation passed. Earlier failing artifacts remain unchanged.
 
-The initial qualification used PyPy 7.3.11, Python 2.7.18, extracted OpenSSL 1.1.1w, and the pinned upstream requirements. Its resolved dependencies are in `.ws-cache/autobahn-runtime/dependencies.lock` while that temporary runtime remains installed.
+The initial qualification used PyPy 7.3.11, Python 2.7.18, extracted OpenSSL 1.1.1w, and the pinned upstream requirements. Phase 4 removed that temporary runtime after qualification.
 
 ## Cleanup and routine testing
 
 The temporary worker probe under `/tmp/opencode/ws-worker-probe`, its temporary documents, the runtime verification script, startup artifacts, installer caches, and temporary decision log were removed after qualification. The qualification reports and production fixtures remain.
 
-Routine `cargo test --release --locked` runs Phases 0 through 3 without Python. It uses the Rust toolchain and clang for the prepared native fixtures. `native_socket_correctness` retains the real peers, allocation and lifecycle checks, overload, controls, negative handshakes, and directional deadlines.
+Phase 3 is now an optional suite selected with `--no-default-features --features phase3 --test phase3`. It uses the Rust toolchain and clang for the prepared native fixtures. `native_socket_correctness` retains the real peers, allocation and lifecycle checks, overload, controls, negative handshakes, and directional deadlines. The [phase selection policy](ws-phased-plan.md#phase-scoped-test-selection) describes when to select it.
 
 The post-cleanup full Cargo run passed all four routine tests with Autobahn and Python environment settings unset. The optional Autobahn test was ignored as intended. The [native-only summary](../results/ws/cargo-1795513231362273636-107641/phase-3/summary.json) records `scope: native-correctness`. Formatting and diff checks passed. Autobahn itself was not rerun during cleanup; its earlier qualification evidence remains valid.
 
-`autobahn_client_conformance` is now an ignored, explicitly selected Cargo test. Its Python peer is temporary and is not a dependency for the library, deployment, or routine testing in later phases. Rerun it only when a concrete protocol change makes conformance testing absolutely necessary. The [testing dependency policy](ws-phased-plan.md#testing-dependency-policy) records its removal once the working library is qualified through the real Bend message path. Native and optional conformance summaries name their scope separately, so a native-only run does not claim new Autobahn evidence.
-
-An explicit optional conformance rerun uses the cached peer paths below:
-
-```sh
-CC=/usr/lib/llvm-19/bin/clang \
-CXXFLAGS=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13 \
-WS_AUTOBAHN_PYTHON="$PWD/.ws-cache/autobahn-runtime/pypy2.7-v7.3.11-linux64/bin/pypy" \
-LD_LIBRARY_PATH="$PWD/.ws-cache/autobahn-runtime/openssl/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-PYTHONDONTWRITEBYTECODE=1 \
-cargo test --release --locked -p ws-reference --test phase3 autobahn_client_conformance -- --ignored --exact --nocapture
-```
+Phase 4 removed `autobahn_client_conformance` and its temporary Python tooling. Renewed conformance work requires separately provisioned tooling for a concrete protocol change. A native-only run does not claim new Autobahn evidence.
 
 The original final focused command used `-p ws-reference --test phase3 -- --nocapture` before this separation. Its passing 301-case evidence remains unchanged. Phase 4 can now connect the real Bend message API to this native client.
