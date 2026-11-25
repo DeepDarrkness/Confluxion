@@ -1,0 +1,35 @@
+name: CI skill smoke
+
+on:
+  push:
+    branches: ["cloudagent/**"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/ws/**"
+      - "bench/ws/reference-rs/Cargo.toml"
+      - ".opencode/skills/deterministic-ci/**"
+      - ".github/workflows/ci-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Check workspace metadata and JavaScript syntax
+        run: |
+          test -s .opencode/skills/deterministic-ci/SKILL.md
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+          node --check src/ws/effects/native.js
+          printf 'CI_SKILL_SMOKE_OK Confluxion\n'
