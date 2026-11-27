@@ -1,6 +1,30 @@
 # Phase 5 controller reference
 
-Phase 5 implements scheduled message checks and explicit performance qualification. The user initially selected fast checks, then requested full qualification and soak. Phase 5 is **Blocked** because full qualification failed its long-capacity gate. The performance targets remain unchanged.
+Phase 5 implements scheduled message checks and explicit performance qualification. Phase 5 is **Blocked**. The November 27 bounded campaign failed the reference 20-second capacity latency gate. The numerical performance targets remain unchanged. Historical extended qualification also remains unpassed.
+
+## Current bounded qualification
+
+`bench/ws/profiles/local-perf-v2.json` is the default profile. The user approved three fully qualified single-worker anchors: 64-byte W1 in each direction and 256-byte symmetric W2 on one connection. Each retains five alternating three-path capacity sets at 5-second warmup and 20-second measurement, plus five alternating half-load pairs for each comparison at 5-second warmup and 10-second measurement. The other ten cases receive 3-second warmup and 5-second screening only.
+
+The unchanged gates are 80% median and 75% paired ratios, 2 ms capacity p99, 1 ms native outbound and 2 ms Bend half-load p99, 5% reference spread, 1.25-times generator/peer headroom, and existing integrity, queue, memory, and cleanup limits. Capacity, half-load, and headroom require at least 10,000 in-window observations per active stream. Reference spread uses independently refreshed passing/failing boundary intervals, including their uncertainty. Short probe rates are not qualified capacities.
+
+W4 runs each candidate, receiver, and 10/100/1,000 ms pause condition once. W5 runs 180 seconds per candidate with three persistent lifecycle cycles. Prior unchanged Phases 1–4 protocol, repeated lifecycle/pause, and million-message evidence is reused. The historical 30-minute soak guarantee is not claimed by this profile. Calibration has a six-minute cap within a 3,600-second campaign deadline. Actor, build, and profiler processes use bounded waits and process-group cleanup; the launch has an outer timeout.
+
+```sh
+timeout --signal=TERM --kill-after=5s 3600s env WS_PHASE5_PERF=/usr/lib/linux-tools/6.8.0-151-generic/perf WS_PHASE5_STRACE=/usr/bin/strace cargo test --release --locked -p ws-reference --test phase5 phase5_full_qualification -- --ignored --exact --test-threads=1 --nocapture
+```
+
+Use `WS_PHASE5_EXTENDED=1` to select the preserved `local-perf-v1` profile and historical extended matrix. It does not use the bounded campaign timings.
+
+The [November 27 checkpoint](ws-phased-plan.md#phase-5-checkpoint-november-27-2026) records the actual campaign and scoped correctness results. The final [summary](../results/ws/cargo-1795774532680549456-6542/phase-5/summary.json) reports failure, not completion: at 228,125 reference messages per second per direction, p99 was 4.939 ms outbound and 7.291 ms inbound. The campaign ended after 126.86 seconds. Later qualification gates were not reached. Diagnostic runs are separate from capacity measurements, and short calibration candidates cannot supply ratios.
+
+The [retained diagnostic manifest](../results/ws/cargo-1795774532680549456-6542/phase-5/limiter.json) binds exact artifacts and checksums. CPU sampling now uses `-g --user-callchains` for WSL2. The installed `strace` ran, but Native failed during the intrusive trace. No complete limiter assessment or Phase 5 pass exists.
+
+The ignored `bounded::phase5_cancellation_control` exercises cancellation and reaping of a real waiting reference peer. The ignored `bounded::phase5_assess_evidence` reads `WS_PHASE5_EVIDENCE` and `WS_PHASE5_ASSESSMENT` without new traffic. It rejects a failed or incomplete numerical campaign, changed measurements or validators, missing tool evidence, duplicate anchor reports, and stale actor references. A later assessment cannot promote this failed campaign.
+
+## Historical extended controller
+
+The following sections describe the preserved `local-perf-v1` campaign and its November 24 evidence. The bounded policy above governs current Phase 5 closure.
 
 ## Cargo targets
 
@@ -9,7 +33,7 @@ Phase 5 implements scheduled message checks and explicit performance qualificati
 The explicit long entry point is:
 
 ```sh
-cargo test --release --locked -p ws-reference --test phase5 phase5_full_qualification -- --ignored --exact --test-threads=1
+WS_PHASE5_EXTENDED=1 cargo test --release --locked -p ws-reference --test phase5 phase5_full_qualification -- --ignored --exact --test-threads=1
 ```
 
 Failed or inconclusive qualification exits unsuccessfully and leaves `phase_pass: false` in its summary.

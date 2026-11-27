@@ -13,6 +13,8 @@ use std::{
 use tungstenite::{protocol::WebSocketConfig, Message};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#[path = "phase5_bounded.rs"]
+mod bounded;
 const NS: u64 = 1_000_000_000;
 fn require(b: bool, why: &str) -> Result<()> {
     if b {
@@ -328,8 +330,31 @@ fn correctness(t: &Trial, e: &Evidence, profile: &Profile, adverse: bool) -> Res
     }
     Ok(())
 }
-fn capacity_gate(t: &Trial, e: &Evidence, p: &Profile, latency: u64) -> Result<()> {
-    correctness(t, e, p, false)?;
+#[derive(Debug)]
+enum CapacityFailure {
+    Correctness(Box<dyn std::error::Error + Send + Sync>),
+    Observation(Box<dyn std::error::Error + Send + Sync>),
+    Latency,
+    Backlog,
+}
+impl std::fmt::Display for CapacityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Correctness(e) | Self::Observation(e) => write!(f,"{e}"),
+            Self::Latency => write!(f,"scheduled latency gate"),
+            Self::Backlog => write!(f,"frozen tail backlog envelope"),
+        }
+    }
+}
+impl std::error::Error for CapacityFailure {}
+impl From<Box<dyn std::error::Error + Send + Sync>> for CapacityFailure {
+    fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {Self::Observation(e)}
+}
+impl From<&str> for CapacityFailure {
+    fn from(e: &str) -> Self {Self::Observation(e.into())}
+}
+fn capacity_gate(t: &Trial, e: &Evidence, p: &Profile, latency: u64) -> std::result::Result<(),CapacityFailure> {
+    correctness(t, e, p, false).map_err(CapacityFailure::Correctness)?;
     for s in streams(t, e, 1)? {
         if s.rate == 0 {
             continue;
@@ -339,10 +364,6 @@ fn capacity_gate(t: &Trial, e: &Evidence, p: &Profile, latency: u64) -> Result<(
         } else {
             latency
         };
-        require(
-            p99(s.rx, "latency_histogram_us", n(s.rx, "validated")?)? <= budget,
-            "scheduled latency gate",
-        )?;
         let tx = s.tx["samples"].as_array().ok_or("tx samples")?;
         let rx = s.rx["samples"].as_array().ok_or("rx samples")?;
         require(
@@ -360,15 +381,13 @@ fn capacity_gate(t: &Trial, e: &Evidence, p: &Profile, latency: u64) -> Result<(
             let elapsed = ts.saturating_sub(t.start + t.warm * NS).min(t.measure * NS);
             let due = (elapsed * s.rate / NS + 1).min(t.measure * s.rate);
             let validated = b[2].as_u64().ok_or("sample in-window validated")?;
-            require(
-                due.saturating_sub(validated) <= envelope,
-                "frozen tail backlog envelope",
-            )?;
+            if due.saturating_sub(validated) > envelope {return Err(CapacityFailure::Backlog);}
             require(
                 ts.abs_diff(a[0].as_u64().ok_or("producer sample timestamp")?) <= 10_000_000,
                 "unaligned samples",
             )?;
         }
+        if p99(s.rx,"latency_histogram_us",n(s.rx,"validated")?)? > budget {return Err(CapacityFailure::Latency);}
     }
     Ok(())
 }
@@ -378,6 +397,7 @@ struct Process {
     label: String,
     out: PathBuf,
     stop: Option<Arc<AtomicBool>>,
+    campaign_deadline: Option<Instant>,
 }
 struct Lifecycle {
     actor: Process,
@@ -392,7 +412,7 @@ impl Process {
             unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } != -1,
             "readiness fd",
         )?;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = self.campaign_deadline.map_or(Instant::now() + Duration::from_secs(5), |d| d.min(Instant::now() + Duration::from_secs(5)));
         let mut bytes = vec![];
         loop {
             require(
@@ -427,6 +447,7 @@ impl Process {
         Ok(())
     }
     fn wait(&mut self, deadline: Instant) -> Result<i32> {
+        let deadline = self.campaign_deadline.map_or(deadline, |d| d.min(deadline));
         loop {
             require(!self.stop.as_ref().is_some_and(|stop|stop.load(Ordering::Acquire)), "steady soak cancelled after lifecycle failure")?;
             if let Some(s) = self.child.try_wait()? {
@@ -466,6 +487,7 @@ struct Controller {
     build_dir: PathBuf,
     _cpu_lease: Option<fs::File>,
     stop: Option<Arc<AtomicBool>>,
+    campaign_deadline: Option<Instant>,
 }
 fn lock_file(path: &Path) -> Result<fs::File> {
     Ok(fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?)
@@ -497,6 +519,7 @@ fn content_key(bytes: &[u8]) -> Result<String> {
 }
 impl Controller {
     fn prepare(scoped: bool) -> Result<Self> {
+        let started = Instant::now();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
             .canonicalize()?;
@@ -504,17 +527,19 @@ impl Controller {
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join(".ws-cache"))
             .canonicalize()?;
-        let raw: Value = serde_json::from_slice(&fs::read(
-            root.join("bench/ws/profiles/local-perf-v1.json"),
-        )?)?;
+        let extended = env::var("WS_PHASE5_EXTENDED").is_ok_and(|s| s == "1");
+        let raw: Value = serde_json::from_slice(&fs::read(root.join(if extended {
+            "bench/ws/profiles/local-perf-v1.json"
+        } else { "bench/ws/profiles/local-perf-v2.json" }))?)?;
         require(
             n(&raw, "schema")? == 1
                 && n(&raw, "paired_trials")? == 5
-                && n(&raw, "warm_s")? == 10
-                && n(&raw, "measure_s")? == 60,
+                && n(&raw, "warm_s")? == if extended {10} else {5}
+                && n(&raw, "measure_s")? == if extended {60} else {20},
             "frozen profile timing",
         )?;
         require(n(&raw,"calibration_warm_s")?==1 && n(&raw,"calibration_measure_s")?==3 && n(&raw,"qualification_refinements")?==3,"frozen calibration policy")?;
+        let campaign_deadline = if !scoped && !extended {Some(started + Duration::from_secs(n(&raw,"campaign_seconds")?))} else {None};
         let mut mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
         require(
             unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&mask), &mut mask) } == 0,
@@ -545,7 +570,11 @@ impl Controller {
             })
         } else {
             let lease = lock_file(&slots.join(format!("{}-{}.lock",selected[0],selected[1])))?;
-            require(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX)} == 0,"performance CPU slot lock")?;
+            loop {
+                if unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX | libc::LOCK_NB)} == 0 {break;}
+                require(campaign_deadline.is_none_or(|d| Instant::now() < d), "inconclusive: campaign deadline waiting for endpoint CPUs")?;
+                thread::sleep(Duration::from_millis(20));
+            }
             Some(lease)
         };
         let out = root.join(format!(
@@ -586,6 +615,7 @@ impl Controller {
             qualification_running: false,
             _cpu_lease: cpu_lease,
             stop: None,
+            campaign_deadline,
         };
         c.build()?;
         Ok(c)
@@ -632,6 +662,7 @@ impl Controller {
             label: label.into(),
             out: out.into(),
             stop: self.stop.clone(),
+            campaign_deadline: self.campaign_deadline,
         })
     }
     fn build_command(&self, mut c: Command, label: &str) -> Result<String> {
@@ -643,14 +674,13 @@ impl Controller {
         c.current_dir(&self.root)
             .env_remove("BENDRTS")
             .env("BEND_NO_TELEMETRY", "1");
-        let o = c.output()?;
-        fs::write(out.join(format!("{label}.stdout")), &o.stdout)?;
-        fs::write(out.join(format!("{label}.stderr")), &o.stderr)?;
-        require(
-            o.status.success(),
-            &format!("{label}: {}", String::from_utf8_lossy(&o.stderr)),
-        )?;
-        Ok(String::from_utf8(o.stdout)?)
+        c.process_group(0).stdout(fs::File::create(out.join(format!("{label}.stdout")))?)
+            .stderr(fs::File::create(out.join(format!("{label}.stderr")))?);
+        let mut process = Process {child:c.spawn()?,label:label.into(),out:out.clone(),stop:None,campaign_deadline:self.campaign_deadline};
+        let status = process.wait(Instant::now()+Duration::from_secs(120))?;
+        let stderr = fs::read_to_string(out.join(format!("{label}.stderr")))?;
+        require(status==0,&format!("{label}: {stderr}"))?;
+        fs::read_to_string(out.join(format!("{label}.stdout"))).map_err(Into::into)
     }
     fn build(&mut self) -> Result<()> {
         let clang = Path::new("/usr/lib/llvm-19/bin/clang");
@@ -696,17 +726,21 @@ impl Controller {
         files.sort();
         files.dedup();
         let mut tools = vec![];
-        for (program,args) in [("rustc",vec!["-vV"]),(clang.to_str().ok_or("clang path")?,vec!["--version"]),("gcc-13",vec!["--version"]),("ld",vec!["--version"])] {
-            let output = Command::new(program).args(args).output()?;
-            require(output.status.success(),"fixture toolchain version")?;
-            tools.push(json!({"program":program,"version":String::from_utf8_lossy(&output.stdout)}));
+        for (index,(program,args)) in [("rustc",vec!["-vV"]),(clang.to_str().ok_or("clang path")?,vec!["--version"]),("gcc-13",vec!["--version"]),("ld",vec!["--version"])].into_iter().enumerate() {
+            let mut command = Command::new(program);
+            command.args(args);
+            tools.push(json!({"program":program,"version":self.build_command(command,&format!("toolchain-{index}"))?}));
         }
         let identity = json!({"schema":1,"archive":archive,"marker":marker,"pins":pins,"tools":tools,"inputs":checksums(&files)?,"generator":generator_key,"recipe":recipe_key,"flags":"peer: -O3 -DLIBUS_NO_SSL -DUWS_NO_ZLIB -pthread -std=c11/-x c++ -std=c++20 --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13; link: --wrap=malloc,free,calloc,realloc -lstdc++ -pthread; actors: -O2 -g -std=c11 -DBEND_POISON(bend) -lpthread -lm -ldl; Bend 2.0.40"});
         let key = content_key(&serde_json::to_vec(&identity)?)?;
         let base = self.root.join("target/ws-fixtures");
         fs::create_dir_all(&base)?;
         let builder = lock_file(&base.join(format!("{key}.lock")))?;
-        require(unsafe {libc::flock(builder.as_raw_fd(),libc::LOCK_EX)} == 0,"fixture builder lock")?;
+        loop {
+            if unsafe {libc::flock(builder.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)} == 0 {break;}
+            require(self.campaign_deadline.is_none_or(|d|Instant::now()<d),"inconclusive: campaign deadline waiting for fixture builder")?;
+            thread::sleep(Duration::from_millis(20));
+        }
         self.build_dir = base.join(&key);
         fs::create_dir_all(&self.build_dir)?;
         self.peer = self.build_dir.join("uws-reference");
@@ -854,10 +888,12 @@ impl Controller {
     }
     fn diagnostic_command(&self, mut c:Command, report:&Path) -> Command {
         if let Some(tool) = self.diagnostic {
-            let mut wrapped = Command::new(if tool == "perf-stat" { "perf" } else { tool });
+            let mut wrapped = Command::new(if tool == "strace" {
+                env::var_os("WS_PHASE5_STRACE").unwrap_or_else(|| "strace".into())
+            } else {env::var_os("WS_PHASE5_PERF").unwrap_or_else(|| "perf".into())});
             if tool == "perf" {
                 wrapped
-                    .args(["record", "-e", "cpu-clock:u", "-F", "99", "-g", "-o"])
+                    .args(["record", "-e", "cpu-clock:u", "-F", "99", "-g", "--user-callchains", "-o"])
                     .arg(report.with_extension("perf.data"))
                     .arg("--");
             } else if tool == "perf-stat" {
@@ -911,6 +947,7 @@ impl Controller {
             );
     }
     fn trial(&mut self, mut t: Trial) -> Result<(Trial, Evidence)> {
+        require(self.campaign_deadline.is_none_or(|d| Instant::now() + Duration::from_secs(t.warm + t.measure + 8) < d), "inconclusive: insufficient campaign time for complete trial and cleanup")?;
         let out = self.out.join(format!("trial-{:04}", self.next_trial));
         self.next_trial += 1;
         fs::create_dir(&out)?;
@@ -1049,7 +1086,7 @@ impl Controller {
         save(&e.directory.join("sample-evaluator-fixture.json"),&json!({"clients":broken.clients,"peer":broken.peer,"synthetic_timing":true,"purpose":"deterministic evaluator control, not performance evidence"}))?;
         let valid = broken.clients[0].clone();
         broken.clients[0]["streams"][1]["rx"]["samples"][0][0] = json!(t.start + NS + 11_000_000);
-        require(capacity_gate(&t,&broken,&self.profile,2000).is_err(),"late sample accepted")?;
+        require(matches!(capacity_gate(&t,&broken,&self.profile,2000),Err(CapacityFailure::Observation(_))),"late sample classified as capacity saturation")?;
         broken.clients[0] = valid;
         broken.clients[0]["streams"][1]["rx"]["samples"][0][2] = json!(0);
         require(capacity_gate(&t,&broken,&self.profile,2000).is_err(),"drain total hid in-window backlog")?;
@@ -1436,15 +1473,11 @@ impl Controller {
                         for label in labels {
                           if tool == "perf" {
                             let data = e.directory.join(format!("{label}.perf.data"));
-                            let output = Command::new("perf")
-                                .args(["report", "--stdio", "--no-children", "--percent-limit", "0", "-i"])
-                                .arg(&data)
-                                .output();
+                            let mut command = Command::new(env::var_os("WS_PHASE5_PERF").unwrap_or_else(|| "perf".into()));
+                            command.args(["report", "--stdio", "--no-children", "--percent-limit", "0", "-i"]).arg(&data);
+                            let output = self.build_command(command,&format!("perf-report-{}-{label}",self.next_trial));
                             match output {
-                                Ok(o) if o.status.success() => {
-                                    fs::write(e.directory.join(format!("{label}-cpu-profile.txt")), o.stdout)?;
-                                    fs::write(e.directory.join(format!("{label}-perf-report.stderr")), o.stderr)?;
-                                }
+                                Ok(text) => {fs::write(e.directory.join(format!("{label}-cpu-profile.txt")),text)?;}
                                 _ => missing.push(format!("{path:?} {label}: CPU profile unreadable")),
                             }
                           } else if tool == "strace" {
@@ -1469,7 +1502,7 @@ impl Controller {
             }
         }
         let case = format!("{workload:?}");
-        let assessment_path = self.root.join("bench/ws/profiles/local-perf-v1-limiter-assessments.json");
+        let assessment_path = env::var_os("WS_PHASE5_ASSESSMENT").map(PathBuf::from).unwrap_or_else(|| if self.profile.raw["name"] == "local-perf-v2" {self.out.join("limiter-assessments.json")} else {self.root.join("bench/ws/profiles/local-perf-v1-limiter-assessments.json")});
         let assessments: Value = fs::read(&assessment_path).ok().and_then(|b|serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
         let assessment = assessments.as_array().and_then(|rows| rows.iter().find(|r|r["workload"] == case));
         let assessed = assessment.is_some_and(|a| {
@@ -1508,7 +1541,8 @@ impl Controller {
                 })
         });
         if !assessed {missing.push(format!("{case}: missing local evidence-backed limiter assessment in {}",assessment_path.display()));}
-        let report = json!({"workload":case,"capacities":capacities,"missing":missing,"diagnostics":diagnostics,"assessment":assessment,"assessment_valid":assessed,"phase_pass":false});
+        let artifact_hashes = bounded::diagnostic_hashes(&diagnostics)?;
+        let report = json!({"workload":case,"capacities":capacities,"profile":self.profile.raw,"missing":missing,"diagnostics":diagnostics,"artifact_hashes":artifact_hashes,"assessment":assessment,"assessment_valid":assessed,"phase_pass":false});
         save(&self.out.join(format!("limiter-case-{:04}.json",self.next_trial)), &report)?;
         save(&self.out.join("limiter.json"), &report)?;
         Ok(missing)
@@ -1710,14 +1744,17 @@ impl Controller {
             build_dir: self.build_dir.clone(),
             _cpu_lease: None,
             stop: Some(stop.clone()),
+            campaign_deadline: self.campaign_deadline,
         };
         let steady = thread::spawn(move || -> Result<(Trial, Evidence)> {
-            let (t, e) = actor.run_case(path, Workload::W5, rate, 0, 1800)?;
+            let seconds = n(&actor.profile.raw,"w5_seconds")?;
+            let (t, e) = actor.run_case(path, Workload::W5, rate, 0, seconds)?;
             capacity_gate(&t, &e, &actor.profile, n(&actor.profile.raw, "capacity_p99_us")?)?;
-            actor.record(&t, &e, "continuous 30-minute half-load actor")?;
+            actor.record(&t, &e, "continuous profile-duration half-load actor")?;
             Ok((t, e))
         });
-        let lifecycle = self.lifecycle(path, rate.max(50000), 30, 60);
+        let cycles = n(&self.profile.raw,"w5_seconds")? / n(&self.profile.raw,"w5_lifecycle_interval_s")?;
+        let lifecycle = self.lifecycle(path, rate.max(50000), cycles as usize, n(&self.profile.raw,"w5_lifecycle_interval_s")?);
         if lifecycle.is_err() {stop.store(true,Ordering::Release);}
         let result = steady.join().map_err(|_| "soak actor thread panic")?;
         lifecycle?;
@@ -1725,7 +1762,7 @@ impl Controller {
         self.record(
             &t,
             &e,
-            "30-minute soak with concurrent lifecycle campaigns on same endpoint CPU",
+            "profile-duration stability with concurrent lifecycle on same endpoint CPU",
         )?;
         Ok(())
     }
@@ -2281,10 +2318,10 @@ fn phase5_standalone_soak() -> Result<()> {
     Controller::prepare(false)?.standalone_soak(&checkpoint,&selected)
 }
 #[test]
-#[ignore = "explicit long Phase 5 capacity, overload and 30-minute soak qualification"]
+#[ignore = "explicit bounded single-worker qualification; WS_PHASE5_EXTENDED=1 selects historical full matrix"]
 fn phase5_full_qualification() -> Result<()> {
     let mut c = Controller::prepare(false)?;
-    let verdict = match c.qualification() {
+    let verdict = match if c.profile.raw["name"] == "local-perf-v2" {c.bounded_qualification()} else {c.qualification()} {
         Ok(v) => v,
         Err(e) => {
             let reason = e.to_string();
@@ -2300,9 +2337,10 @@ fn phase5_full_qualification() -> Result<()> {
         Verdict::Failed(s) => (false, "failed", s),
         Verdict::Inconclusive(s) => (false, "inconclusive", s),
     };
+    if !pass && c.profile.raw["name"] == "local-perf-v2" {c.bounded_failure_diagnostics()?;}
     save(
         &c.out.join("summary.json"),
-        &json!({"scope":"qualification","qualification_run":true,"phase_pass":pass,"verdict":label,"reason":reason,"trials":c.records}),
+        &json!({"scope":if c.profile.raw["name"] == "local-perf-v2" {"bounded single-worker qualification"} else {"extended qualification"},"profile":c.profile.raw["name"],"qualification_run":true,"phase_pass":pass,"verdict":label,"reason":reason,"trials":c.records}),
     )?;
     require(pass, &format!("Phase 5 {label}: {reason}"))
 }

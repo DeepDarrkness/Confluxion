@@ -6,7 +6,7 @@ Design: when changing socket ownership or computation scheduling, read the [sele
 
 ## Current status
 
-Status as of November 24, 2026. The Phase 4 integration invocation passed all routine Cargo gates for Phases 0 through 4. The real Bend path validated one million messages each direction, bounded batches, transport progress during a 138 ms effect-free computation interval, receiver pauses, resource limits, and cleanup. See the [Phase 4 qualification](ws-phase4-verification.md#integration-qualification) and [summary](../results/ws/cargo-1795520741553854400-164059/phase-4/summary.json). Phase 3's recorded qualification includes all 301 selected Autobahn cases under the approved fixture rules. The temporary adapter and Python runtime are now removed. The original multi-hour baseline, noise, and headroom gate was removed by user choice, not passed. Throughput qualification remains TODO for Phase 5. The status table is authoritative for phase progress.
+Status as of November 27, 2026. Phases 0 through 4 retain their November 24 passes. The real Bend path validated one million messages each direction, bounded batches, transport progress during a 138 ms effect-free computation interval, receiver pauses, resource limits, and cleanup. See the [Phase 4 qualification](ws-phase4-verification.md#integration-qualification) and [summary](../results/ws/cargo-1795520741553854400-164059/phase-4/summary.json). Phase 3's recorded qualification includes all 301 selected Autobahn cases under the approved fixture rules. The temporary adapter and Python runtime are removed. Phase 5 now uses the approved bounded `local-perf-v2` campaign. Its November 27 retry failed the first reference capacity latency gate; Phase 5 remains Blocked. The status table is authoritative for phase progress.
 
 | Phase | Status | Checkable outcome | Required gate before proceeding |
 | --- | --- | --- | --- |
@@ -15,7 +15,7 @@ Status as of November 24, 2026. The Phase 4 integration invocation passed all ro
 | 2 | Passed | Qualified bounded Tungstenite protocol integration | Post-cleanup gate passed in the Phase 3 integration run November 24, 2026; [verification](ws-phase2-verification.md), [evidence](../results/ws/cargo-1795511937858175300-97357/phase-2/summary.json) |
 | 3 | Passed | Independent full-duplex Rust transport | Real-peer interoperability, all 301 required cases under approved fixture rules, bounded overload, deadlines, and cleanup passed November 24, 2026; [verification](ws-phase3-verification.md), [evidence](../results/ws/cargo-1795512093612704375-99189/phase-3/summary.json) |
 | 4 | Passed | Complete Bend message path | Real Bend million-message transfer each way, bounded batches, independent IO during pure computation, pauses, and cleanup passed November 24, 2026; [verification](ws-phase4-verification.md#integration-qualification), [evidence](../results/ws/cargo-1795520741553854400-164059/phase-4/summary.json) |
-| 5 | Blocked | Seven parallel routine checks with cached builds; explicit throughput qualification | [Full qualification](../results/ws/cargo-1795536337824877458-204758/phase-5/summary.json) failed the long-capacity gate after its frozen refinement limit. Five passing pairs were not established. Native soak was interrupted; Bend soak did not start. Work is checkpointed at user request; see [remaining work](#phase-5-checkpoint-november-24-2026) |
+| 5 | Blocked | Seven parallel routine checks with cached builds; bounded single-worker throughput qualification | November 27 `local-perf-v2` retry failed after 126.86 s: reference 20-second capacity p99 was 4.939 ms outbound and 7.291 ms inbound, above 2 ms. No five-pair set or stability pass was established. [Summary](../results/ws/cargo-1795774532680549456-6542/phase-5/summary.json), [current checkpoint](#phase-5-checkpoint-november-27-2026). Historical `local-perf-v1` remains unpassed. |
 | 6 | Not started | Bounded reusable computation workers | Pool limits, result correlation, compute correctness, and ordering pass under load |
 | 7 | Deferred; optional | All-Bend WebSocket implementation behind the same Bend API | Revisit after reliable Rust-backed SpacetimeDB integration; qualify equivalent interoperability, independent progress, bounds, and cleanup before replacement |
 
@@ -149,6 +149,40 @@ Completed November 24, 2026. The [integration qualification](ws-phase4-verificat
 
 ## Phase 5. Tune and qualify local message throughput
 
+### Approved bounded campaign, November 27, 2026
+
+The user approved a one-hour campaign replacing the routine Phase 5 closure matrix. `local-perf-v2` retains the 80% median and 75% paired ratios, 1 ms native outbound and 2 ms Bend half-load latency, 5% reference-noise limit, 1.25-times generator/peer headroom, and existing integrity/resource limits. It qualifies W1 64-byte messages in both directions and one-connection symmetric W2 with five alternating capacity sets at 5 seconds warmup and 20 seconds measurement. Each comparison retains five alternating half-load pairs at 5 seconds warmup and 10 seconds measurement. The other ten cases receive 3-second warmup and 5-second screening only, not qualified capacity claims.
+
+W4 runs once for each of the twelve candidate, receiver, and pause conditions. W5 runs 180 seconds per candidate with three persistent normal-close/queued-disconnect cycles. This is short stability evidence, not a 30-minute soak guarantee. Unchanged Phases 1–4 protocol, ownership, million-message, repeated-pause, and lifecycle qualifications are reused. Earlier checks are selected only if their boundary changes.
+
+The campaign reserves one endpoint CPU pair and has a 3,600-second deadline. Calibration has a six-minute cap, using two minutes of the original seven-minute preparation/reserve allowance; the overall limit remains one hour. Reference noise uses fresh passing/failing boundaries, not repeated delivery at one fixed rate. Accepted capacity, half-load, and headroom streams require at least 10,000 measured observations. Missing evidence or exhausted budgets are inconclusive. `WS_PHASE5_EXTENDED=1` selects historical `local-perf-v1`; it is outside this duration limit.
+
+After Phase 5 passes, complete the single-worker SpacetimeDB delivery track before Phase 6. Phase 7 remains optional.
+
+### Phase 5 checkpoint, November 27, 2026
+
+The approved campaign was run twice. The first invocation ended inconclusively after 19.38 seconds because its calibration parser did not recognize a reference rejection outcome. At 500,000 scheduled messages per second per direction, the peer reached 4,096 descriptors and rejected messages; the client's forward sequence gap followed that recorded saturation. The retry recognizes only this specific, accounted reference outcome as a failed-rate boundary. Arbitrary actor failures and invalid observations still make calibration inconclusive. User-only call chains also fixed `perf record` access under WSL2 without changing kernel settings.
+
+The final [campaign](../results/ws/cargo-1795774532680549456-6542/phase-5/summary.json) failed after 126.86 seconds, with a 126.88-second whole-command elapsed time and a fixture cache hit. Calibration used 88.39 seconds and produced unqualified candidates of 228,125 Reference, 92,968 Native, and 16,288 Bend messages per second per direction. The first reference capacity trial then ran 5 seconds of warmup and 20 seconds of measurement at 228,125 per direction. Both actors exited successfully, but scheduled-arrival p99 was 4.939 ms toward the peer and 7.291 ms toward the client. Both exceed the unchanged 2 ms capacity ceiling. See [trial 0022](../results/ws/cargo-1795774532680549456-6542/phase-5/trial-0022/trial.json) and [trial results](../results/ws/cargo-1795774532680549456-6542/phase-5/trials.json).
+
+Five complete comparison sets, independent reference-noise qualification, paired ratios, half-load latency, headroom, W1 anchors, remaining screens, W4, and three-minute W5 were not established. The run stopped at the first failed qualification gate rather than consuming its one-hour allowance. No worker, fixture, or profiler process remained after cleanup inspection. No unchanged earlier phase was rerun.
+
+Selected correctness evidence:
+
+| Check | Result | Build and cache evidence |
+| --- | --- | --- |
+| Initial seven routine checks | Six passed; Bend overload/lifecycle was inconclusive from missed fault-burst arrivals | 9.77 s Cargo compilation; 11.02 s test time; one fixture build and six cache hits for that input set |
+| Isolated Bend overload/lifecycle rerun | Passed in 2.82 s | 0.02 s Cargo preparation; cache hit; [summary](../results/ws/cargo-1795773934837839360-5387/phase-5/summary.json) |
+| Final affected evidence controls | Passed in 2.35 s | 9.68 s Cargo compilation; cache hit; [summary](../results/ws/cargo-1795774530305659457-6490/phase-5/summary.json) |
+| Real-peer cancellation control | Passed; cancellation reaped the waiting reference peer and its process group | 6.26 s test time including the final fixture input-set build; [evidence](../results/ws/cargo-1795774315191024784-6014/phase-5/cancellation-control/summary.json) |
+| Final qualification retry | Failed the reference latency gate in 126.86 s | 0.01 s Cargo preparation; final fixture cache hit; [build identity](../results/ws/cargo-1795774532680549456-6542/phase-5/build/identity.json) |
+
+`strace` 6.8 is installed. The working profiling binary is `/usr/lib/linux-tools/6.8.0-151-generic/perf`; the `/usr/bin/perf` wrapper does not match the running WSL2 kernel. CPU sampling requires `-g --user-callchains`. The final [diagnostic collection](../results/ws/cargo-1795774532680549456-6542/phase-5/limiter.json) has readable profiles and software counters for each path and peer. Native failed during its intrusive `strace` trial. These short profiles do not establish a complete evidence-backed limiter assessment or qualified capacities.
+
+Next action: use the retained reference evidence to establish a repeatable 20-second capacity boundary, then rerun the affected comparison. Investigate time-query, generation, scheduling, and peer costs from profiles without assuming which is limiting. Keep the frozen targets, preserve previous failures, and select only affected checks after a change. Phase 5 remains Blocked until the complete bounded gate passes.
+
+### Historical extended campaign
+
 The default Cargo command runs seven independent scheduled delivery, integrity, bounds, and cleanup checks with shared cached builds. The seven-test run passed before the latest scoped fixes. Full qualification failed the long-capacity gate after the frozen refinement limit. Native soak was interrupted after a lifecycle-validator fault; the queued Bend soak did not start. The latest calibration command was interrupted during Cargo compilation. The [controller reference](ws-phase5-verification.md) records the frozen profile, commands, and failing gate. Performance targets remain unchanged.
 
 - Outcome: the standalone library meets explicit throughput, latency, and memory targets on the frozen local profile.
@@ -192,7 +226,7 @@ Resume in this order:
 2. Regenerate the measured-rate checkpoint with `phase5_calibrate_soak`. Old checkpoints can have a different fixture key and must not be relabeled as final-build measurements.
 3. Run `phase5_standalone_soak` with `WS_PHASE5_SOAK_CHECKPOINT` pointing to that new checkpoint and `WS_PHASE5_SOAK_PATH=Native`, then `Bend`. Verify every persistent lifecycle cycle, exact outcomes, resource restoration, and the complete steady interval.
 4. Capture CPU profiles and counters to identify the long-trial limiter, establish repeatable capacity, and rerun the affected qualification. `perf` and `strace` must be provisioned again; this session's temporary tools were removed. This host supports `cpu-clock:u` and software counters, but not hardware cycles or instructions.
-5. Mark Phase 5 Passed only after all frozen noise, headroom, paired-ratio, half-load latency, W4, and W5 gates pass. Advance to Phase 6 afterward.
+5. Mark Phase 5 Passed only after the approved bounded noise, headroom, paired-ratio, half-load latency, W4, and W5 gates pass. Complete the single-worker SpacetimeDB delivery track afterward, before Phase 6. The historical extended profile remains separate qualification.
 
 ## Phase 6. Validate the bounded computation pool
 
