@@ -1,4 +1,5 @@
 #include "abi.h"
+#include "byte_buffer.h"
 typedef struct { u64 closer, deadline; u32 count, bytes, batch, failure; } WsEffectState;
 
 static Term ws_record(Env e, u32 id, u32 n, Term *fields) {
@@ -55,55 +56,44 @@ static Term ws_connect_run(Env e, Term *f, IoWork *w) {
 }
 #endif
 
-static u32 ws_bytes(Env e, Term s, u8 *out, u32 cap, u32 *n) {
-  while (term_aux(s) == CID(Con)) {
-    u64 loc = term_peek(e.mem, s);
-    if (*n == cap) return WS_OVERSIZE;
-    if (e.mem[loc] > 255) return WS_INVALID;
-    out[(*n)++] = e.mem[loc]; s = e.mem[loc + 1];
-  }
-  return WS_OK;
-}
-static void ws_free_bytes(Env e, Term s) {
-  while (term_aux(s) == CID(Con)) {
-    Term fields[2]; spare_free(e, cls_fit(2), ctr_take(e, s, 2, fields)); s = fields[1];
-  }
-}
 #ifdef CID(offer)
 static Term ws_offer_run(Env e, Term *f, IoWork *w) {
-  u8 *bytes = malloc(1048576); u32 n = 0;
-  u32 code = bytes ? ws_bytes(e, f[1], bytes, 1048576, &n) : WS_FAILED;
-  WsMessageSpan span = {.len=n};
+  u8 *bytes; u32 capacity;
+  u32 code = byte_array_view(e, f[1], f[2], &bytes, &capacity);
   WsBatchAdmission a = {.code=code};
-  if (code == WS_OK) a = ws_socket_offer_batch(io_hand_v(f[0]), &span, 1, bytes, n);
-  free(bytes);
+  if (code == WS_OK) a = ws_socket_offer_buffer(io_hand_v(f[0]), bytes, f[2]);
+  Term fields[] = {a.code, f[1], f[2]};
+  Term result;
   if (a.accepted == 1) {
-    ws_free_bytes(e, f[1]); return io_tup(e, f[0], term_pak(CID(Accepted), 0));
+    result = ws_record(e, CID(Accepted), 2, fields + 1);
+  } else {
+    result = a.code == WS_FULL ? ws_record(e, CID(Full), 2, fields + 1)
+                              : ws_record(e, CID(Rejected), 3, fields);
   }
-  return io_tup(e, f[0], a.code == WS_FULL ? io_box(e, CID(Full), f[1]) : io_node(e, CID(Rejected), a.code, f[1]));
+  return io_tup(e, f[0], result);
 }
 #endif
 #ifdef CID(offer_batch)
 static Term ws_offer_batch_run(Env e, Term *f, IoWork *w) {
-  u8 *bytes = malloc(65536); WsMessageSpan spans[128]; u32 n = 0, count = 0;
-  u32 code = bytes ? WS_OK : WS_FAILED;
-  for (Term s = f[1]; code == WS_OK && term_aux(s) == CID(Con);) {
+  WsBuffer buffers[128]; u32 n = 0, count = 0, code = WS_OK;
+  Term s = f[1];
+  while (code == WS_OK && term_aux(s) == CID(BatchCon)) {
     if (count == 128) { code = WS_OVERSIZE; break; }
-    u64 loc = term_peek(e.mem, s); u32 offset = n;
-    code = ws_bytes(e, e.mem[loc], bytes, 65536, &n);
-    spans[count++] = (WsMessageSpan){.offset=offset, .len=n-offset};
-    s = e.mem[loc + 1];
+    if (term_tag(s) != TAG_CTR || cid_arity(term_aux(s)) != 3) { code = WS_INVALID; break; }
+    u64 loc = term_peek(e.mem, s); u8 *bytes; u32 capacity;
+    if (e.mem[loc + 1] > UINT32_MAX) { code = WS_INVALID; break; }
+    u32 len = e.mem[loc + 1];
+    code = byte_array_view(e, e.mem[loc], len, &bytes, &capacity);
+    if (code != WS_OK) break;
+    if (len > 65536 - n) { code = WS_OVERSIZE; break; }
+    buffers[count++] = (WsBuffer){.bytes=bytes, .len=len, .kind=0};
+    n += len;
+    s = e.mem[loc + 2];
   }
+  if (code == WS_OK && (term_tag(s) != TAG_PAK || term_aux(s) != CID(BatchNil))) code = WS_INVALID;
   WsBatchAdmission a = {.code=code};
-  if (code == WS_OK) a = ws_socket_offer_batch(io_hand_v(f[0]), spans, count, bytes, n);
-  free(bytes);
-  if (a.code == WS_OK) {
-    for (Term s = f[1]; term_aux(s) == CID(Con);) {
-      Term fields[2]; spare_free(e, cls_fit(2), ctr_take(e, s, 2, fields));
-      ws_free_bytes(e, fields[0]); s = fields[1];
-    }
-    return io_tup(e, f[0], term_pak(CID(BatchAccepted), a.accepted));
-  }
+  if (code == WS_OK) a = ws_socket_offer_buffers(io_hand_v(f[0]), buffers, count);
+  if (a.code == WS_OK) return io_tup(e, f[0], io_node(e, CID(BatchAccepted), a.accepted, f[1]));
   return io_tup(e, f[0], a.code == WS_FULL ? io_box(e, CID(BatchFull), f[1]) : io_node(e, CID(BatchRejected), a.code, f[1]));
 }
 #endif
@@ -121,23 +111,21 @@ static Term ws_take_more(Env e, IoWork *w) {
   }
   Term value = 0;
   if (r.code == WS_OK) {
-    Term messages = term_pak(CID(Nil), 0);
-    for (u32 i = r.count; i-- > 0;) {
-      WsMessageSpan span = r.messages[i];
-      Term m = io_node(e, CID(Message), span.kind, io_list(e, (char*)r.bytes + span.offset, span.len));
-      messages = io_node(e, CID(Con), m, messages);
-    }
-    if (err_peek(e.mem)) { ws_socket_release(r.lease); free(state); w->data = NULL; return 0; }
 #ifdef CID(take)
     if (!state->batch) {
-      Term fields[2]; spare_free(e, cls_fit(2), ctr_take(e, messages, 2, fields));
-      Term message[2]; spare_free(e, cls_fit(2), ctr_take(e, fields[0], 2, message));
-      Term payload[] = {io_hand(r.lease), message[0], message[1]};
-      value = ws_record(e, CID(Payload), 3, payload);
+      Term payload[] = {io_hand(r.lease), r.messages[0].kind, 0, r.messages[0].len};
+      value = ws_record(e, CID(Payload), 4, payload);
     }
 #endif
 #ifdef CID(take_batch)
-    if (state->batch) value = io_node(e, CID(Messages), io_hand(r.lease), messages);
+    if (state->batch) {
+      Term messages = term_pak(CID(MetadataNil), 0);
+      for (u32 i = r.count; i-- > 0;) {
+        Term fields[] = {r.messages[i].kind, i, r.messages[i].len, messages};
+        messages = ws_record(e, CID(MetadataCon), 4, fields);
+      }
+      value = io_node(e, CID(Messages), io_hand(r.lease), messages);
+    }
 #endif
   } else {
 #ifdef CID(take)

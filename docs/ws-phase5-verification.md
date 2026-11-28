@@ -1,6 +1,20 @@
 # Phase 5 controller reference
 
-Phase 5 implements scheduled message checks and explicit performance qualification. Phase 5 is **Blocked**. The November 27 bounded campaign failed the reference 20-second capacity latency gate. The numerical performance targets remain unchanged. Historical extended qualification also remains unpassed.
+Phase 5 implements scheduled message checks and explicit performance qualification. Phase 5 is **Blocked**. The November 28 dense correctness and five-pair fixed-load comparison pass, but the bounded campaign stopped at the three-refinement sustained reference-drift limit. Numerical targets remain unchanged. Historical extended qualification also remains unpassed.
+
+## November 28 dense retest
+
+The [approved tasks and final checkpoint](phase5-retest.md#final-november-28-checkpoint) record input identities, selected tests, build/test times, cache hits, comparison ranges, and remaining gates. All eight routine checks pass. Full dense Phase 4 qualification passes. The final five-pair comparison at 12,000 messages/s per direction passes on the final fixture identity.
+
+The [bounded campaign](../results/ws/cargo-1795848288875281882-30078/phase-5/campaign.json) ended inconclusively after 1,159.11 s. Calibration consumed 111.09 s. The reference failed or drifted after each sustained refinement, leaving zero completed anchors. No qualified median ratios, half-load, headroom, screens, W4, or W5 result is available. Readable failure diagnostics do not promote this campaign.
+
+Sustained capacity search runs 5 s warmup and 20 s measurement, with fresh passing/failing boundaries and 1% bracket resolution. It uses the existing 32-step limit and consumes the campaign budget. Short calibration remains limited to six minutes. Fresh reference endpoints are rechecked between comparison sets. A valid rate failure or bracket drift refines only the affected path and restarts all five sets, at most three times. Missing observations and unknown failures remain inconclusive.
+
+One typed classifier distinguishes latency/backlog failure, narrowly accounted queue-rejection sequence gaps, and invalid evidence. Candidate sequence/duplicate reports include expected and observed identities. A failed library flush can deliver a complete prefix before the whole output buffer drains, so fault accounting retains the conservative flush count and bounds receiver-confirmed work by admission. Native worker transmission counts remain strict. Passing capacity trials require exact scheduled delivery and all original latency/backlog bounds.
+
+The receive-idle fixture correction skips a 50 µs sleep while receive work is queued. Persistent lifecycle barriers carry an explicit per-session receive pause for queued-disconnect controls. Routine checks do not enable the qualification-only zero-missed-arrival gate. Qualification keeps that gate.
+
+Ignored focused targets `bounded::phase5_sustained_probe`, `bounded::phase5_limiter_probe`, and `bounded::phase5_rejection_evidence` select one sustained boundary, diagnostic collection, or real saved rejection evidence with damage controls. None declares a Phase 5 pass. Diagnostics collect five-second profiles/counters; intrusive syscall traces use at most 1,000 messages/s and record their actual rates. User-only software context-switch counters returning zero remain an assessment gap.
 
 ## Current bounded qualification
 

@@ -1,5 +1,6 @@
 import Base
 import ./effects/native.bend as Native
+import ../bytes/main.bend as Bytes
 
 type Session is Type:
   Session{handle: File}
@@ -15,15 +16,15 @@ type Start is Type:
   Started{session: Session, closer: Closer}
   StartFailed{code: U32}
 type Admission is Type:
-  Accepted{}
-  Full{bytes: List<U32>}
-  Rejected{code: U32, bytes: List<U32>}
+  Accepted{bytes: Bytes.Buffer}
+  Full{bytes: Bytes.Buffer}
+  Rejected{code: U32, bytes: Bytes.Buffer}
 type BatchAdmission is Type:
-  BatchAccepted{count: U32}
-  BatchFull{messages: List<List<U32>>}
-  BatchRejected{code: U32, messages: List<List<U32>>}
+  BatchAccepted{count: U32, messages: List<Bytes.Buffer>}
+  BatchFull{messages: List<Bytes.Buffer>}
+  BatchRejected{code: U32, messages: List<Bytes.Buffer>}
 type Message is Type:
-  Message{kind: U32, bytes: List<U32>}
+  Message{kind: U32, index: U32, length: U32}
 type Receive is Type:
   Empty{}
   End{reason: U32}
@@ -50,56 +51,64 @@ def connect(endpoint: Endpoint) -> IO(Start):
         return wrap_start(r)
 def wrap_admission(r: Native.Admission) -> Admission:
   match r:
-    case Native.Accepted{}:
-      Accepted{}
-    case Native.Full{bytes}:
-      Full{bytes}
-    case Native.Rejected{code, bytes}:
-      Rejected{code, bytes}
+    case Native.Accepted{words, length}:
+      Accepted{Bytes.ByteBuffer{words, length}}
+    case Native.Full{words, length}:
+      Full{Bytes.ByteBuffer{words, length}}
+    case Native.Rejected{code, words, length}:
+      Rejected{code, Bytes.ByteBuffer{words, length}}
 def wrap_offer(pair: File & Native.Admission) -> Session & Admission:
   (h, a) = pair
   (Session{h}, wrap_admission(a))
-def offer(s: Session, bytes: List<U32>) -> IO(Session & Admission):
-  match s:
-    case Session{h}:
+def offer(s: Session, bytes: Bytes.Buffer) -> IO(Session & Admission):
+  match s bytes:
+    case Session{h} Bytes.ByteBuffer{words, length}:
       do IO<Session & Admission>:
-        pair : File & Native.Admission <- Native.offer(h, bytes)
+        pair : File & Native.Admission <- Native.offer(h, words, length)
         return wrap_offer(pair)
+def unwrap_buffers(messages: List<Bytes.Buffer>) -> Native.Batch:
+  match messages:
+    case Nil{}:
+      Native.BatchNil{}
+    case Con{Bytes.ByteBuffer{words, length}, rest}:
+      Native.BatchCon{words, length, unwrap_buffers(rest)}
+def wrap_buffers(messages: Native.Batch) -> List<Bytes.Buffer>:
+  match messages:
+    case Native.BatchNil{}:
+      []
+    case Native.BatchCon{words, length, rest}:
+      Bytes.ByteBuffer{words, length} <> wrap_buffers(rest)
 def wrap_batch_admission(r: Native.BatchAdmission) -> BatchAdmission:
   match r:
-    case Native.BatchAccepted{count}:
-      BatchAccepted{count}
+    case Native.BatchAccepted{count, messages}:
+      BatchAccepted{count, wrap_buffers(messages)}
     case Native.BatchFull{messages}:
-      BatchFull{messages}
+      BatchFull{wrap_buffers(messages)}
     case Native.BatchRejected{code, messages}:
-      BatchRejected{code, messages}
+      BatchRejected{code, wrap_buffers(messages)}
 def wrap_batch_offer(pair: File & Native.BatchAdmission) -> Session & BatchAdmission:
   (h, a) = pair
   (Session{h}, wrap_batch_admission(a))
-def offer_batch(s: Session, messages: List<List<U32>>) -> IO(Session & BatchAdmission):
+def offer_batch(s: Session, messages: List<Bytes.Buffer>) -> IO(Session & BatchAdmission):
   match s:
     case Session{h}:
       do IO<Session & BatchAdmission>:
-        pair : File & Native.BatchAdmission <- Native.offer_batch(h, messages)
+        pair : File & Native.BatchAdmission <- Native.offer_batch(h, unwrap_buffers(messages))
         return wrap_batch_offer(pair)
-def wrap_message(m: Native.Message) -> Message:
-  match m:
-    case Native.Message{kind, bytes}:
-      Message{kind, bytes}
-def wrap_messages(ms: List<Native.Message>) -> List<Message>:
+def wrap_messages(ms: Native.Metadata) -> List<Message>:
   match ms:
-    case Nil{}:
+    case Native.MetadataNil{}:
       []
-    case Con{m, rest}:
-      wrap_message(m) <> wrap_messages(rest)
+    case Native.MetadataCon{kind, index, length, rest}:
+      Message{kind, index, length} <> wrap_messages(rest)
 def wrap_receive(r: Native.Receive) -> Receive:
   match r:
     case Native.Empty{}:
       Empty{}
     case Native.End{reason}:
       End{reason}
-    case Native.Payload{h, message}:
-      Payload{Lease{h}, wrap_message(message)}
+    case Native.Payload{h, kind, index, length}:
+      Payload{Lease{h}, Message{kind, index, length}}
     case Native.ReceiveFailed{code}:
       ReceiveFailed{code}
 def wrap_take(pair: File & Native.Receive) -> Session & Receive:

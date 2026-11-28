@@ -1,6 +1,8 @@
 import Base
 import ../../src/ws/main.bend as WS
 import ../../src/ws/effects/native.bend as Native
+import ../../src/bytes/main.bend as Bytes
+import ./fixture-bytes.bend as Fixture
 
 type Settings is Data:
   Settings{port: U32, mode: U32, iterations: U32}
@@ -80,28 +82,39 @@ def batch(n: Nat, +sequence: U32) -> List<List<U32>>:
       []
     case 1n+p:
       payload(256n, sequence, 0, 0) <> batch(p, (sequence + 1 : U32))
-def validate_message(m: WS.Message, sequence: U32) -> U32:
-  match m:
-    case WS.Message{kind, bytes}:
-      (kind .|. validate(bytes, sequence, 1, 0) : U32)
-def validation_join(pair: U32 & U32, valid: U32) -> U32 & U32:
-  (other, n) = pair
-  ((valid .|. other : U32), n)
-def validate_batch(ms: List<WS.Message>, +sequence: U32, +count: U32) -> U32 & U32:
+def validated_message(pair: File & List<U32>, kind: U32, length: U32, sequence: U32) -> WS.Lease & U32:
+  (h, bytes) = pair
+  (WS.Lease{h}, (kind .|. (length .^. 256) .|. validate(bytes, sequence, 1, 0) : U32))
+def validate_message(lease: WS.Lease, m: WS.Message, sequence: U32) -> IO(WS.Lease & U32):
+  match lease m:
+    case WS.Lease{h} WS.Message{kind, index, length}:
+      do IO<WS.Lease & U32>:
+        pair : File & List<U32> <- Fixture.lease_list(h, index)
+        return validated_message(pair, kind, length, sequence)
+@unsafe def validate_batch(ms: List<WS.Message>, lease: WS.Lease, +sequence: U32, +count: U32, +valid: U32) -> IO(WS.Lease & (U32 & U32)):
   match ms:
     case Nil{}:
-      (0, count)
+      IO.pure(WS.Lease & (U32 & U32), (lease, (valid, count)))
     case Con{m, rest}:
-      valid = validate_message(m, sequence)
-      validation_join(validate_batch(rest, (sequence + 1 : U32), (count + 1 : U32)), valid)
+      do IO<WS.Lease & (U32 & U32)>:
+        pair : WS.Lease & U32 <- validate_message(lease, m, sequence)
+        validate_batch_next(pair, rest, sequence, count, valid)
+@unsafe def validate_batch_next(pair: WS.Lease & U32, rest: List<WS.Message>, sequence: U32, count: U32, valid: U32) -> IO(WS.Lease & (U32 & U32)):
+  (lease, result) = pair
+  validate_batch(rest, lease, (sequence + 1 : U32), (count + 1 : U32), (valid .|. result : U32))
+def release_validated(pair: WS.Lease & U32, s: WS.Session, sequence: U32) -> IO(WS.Session & U32):
+  (lease, valid) = pair
+  do IO<WS.Session & U32>:
+    check(valid, 0, 10)
+    code : U32 <- WS.Lease.release(lease)
+    check(code, 0, 11)
+    return (s, (sequence + 1 : U32))
 def released(s: WS.Session, r: WS.Receive, +sequence: U32) -> IO(WS.Session & U32):
   match r:
     case WS.Payload{lease, message}:
       do IO<WS.Session & U32>:
-        check(validate_message(message, sequence), 0, 10)
-        code : U32 <- WS.Lease.release(lease)
-        check(code, 0, 11)
-        return (s, (sequence + 1 : U32))
+        pair : WS.Lease & U32 <- validate_message(lease, message, sequence)
+        release_validated(pair, s, sequence)
     case WS.Empty{}:
       IO.pure(WS.Session & U32, (s, sequence))
     case _:
@@ -118,10 +131,15 @@ def batch_checked(pair: U32 & U32, s: WS.Session, lease: WS.Lease, sequence: U32
     code : U32 <- WS.Lease.release(lease)
     check(code, 0, 14)
     return (s, (sequence + count : U32))
+def release_validated_batch(pair: WS.Lease & (U32 & U32), s: WS.Session, sequence: U32) -> IO(WS.Session & U32):
+  (lease, valid) = pair
+  batch_checked(valid, s, lease, sequence)
 def released_batch(s: WS.Session, r: WS.BatchReceive, +sequence: U32) -> IO(WS.Session & U32):
   match r:
     case WS.Messages{lease, messages}:
-      batch_checked(validate_batch(messages, sequence, 0), s, lease, sequence)
+      do IO<WS.Session & U32>:
+        pair : WS.Lease & (U32 & U32) <- validate_batch(messages, lease, sequence, 0, 0)
+        release_validated_batch(pair, s, sequence)
     case WS.BatchEmpty{}:
       IO.pure(WS.Session & U32, (s, sequence))
     case _:
@@ -133,39 +151,53 @@ def received_batch(pair: WS.Session & WS.BatchReceive, sequence: U32) -> IO(WS.S
   released_batch(s, r, sequence)
 @unsafe def send_one(s: WS.Session, bytes: List<U32>) -> IO(WS.Session):
   do IO<WS.Session>:
+    buffer : Bytes.Buffer <- Fixture.from_list(bytes)
+    send_buffer(s, buffer)
+@unsafe def send_buffer(s: WS.Session, bytes: Bytes.Buffer) -> IO(WS.Session):
+  do IO<WS.Session>:
     pair : WS.Session & WS.Admission <- WS.offer(s, bytes)
     admitted_one(pair)
 @unsafe def admitted_one(pair: WS.Session & WS.Admission) -> IO(WS.Session):
   (s, a) = pair
   match a:
-    case WS.Accepted{}:
-      IO.pure(WS.Session, s)
+    case WS.Accepted{bytes}:
+      do IO<WS.Session>:
+        code : U32 <- Bytes.release(bytes)
+        check(code, 0, 16)
+        return s
     case WS.Full{bytes}:
       do IO<WS.Session>:
         IO.sleep(1)
-        send_one(s, bytes)
+        send_buffer(s, bytes)
     case WS.Rejected{code, bytes}:
       do IO<WS.Session>:
         check(code, 0, 16)
+        released : U32 <- Bytes.release(bytes)
         return s
 @unsafe def send_batch(s: WS.Session, messages: List<List<U32>>, count: U32) -> IO(WS.Session):
+  do IO<WS.Session>:
+    buffers : List<Bytes.Buffer> <- Fixture.from_lists(messages)
+    send_buffers(s, buffers, count)
+@unsafe def send_buffers(s: WS.Session, messages: List<Bytes.Buffer>, count: U32) -> IO(WS.Session):
   do IO<WS.Session>:
     pair : WS.Session & WS.BatchAdmission <- WS.offer_batch(s, messages)
     admitted_batch(pair, count)
 @unsafe def admitted_batch(pair: WS.Session & WS.BatchAdmission, +count: U32) -> IO(WS.Session):
   (s, a) = pair
   match a:
-    case WS.BatchAccepted{actual}:
+    case WS.BatchAccepted{actual, messages}:
       do IO<WS.Session>:
+        Fixture.release_all(messages)
         check(actual, count, 17)
         return s
     case WS.BatchFull{messages}:
       do IO<WS.Session>:
         IO.sleep(1)
-        send_batch(s, messages, count)
+        send_buffers(s, messages, count)
     case WS.BatchRejected{code, messages}:
       do IO<WS.Session>:
         check(code, 0, 18)
+        Fixture.release_all(messages)
         return s
 @unsafe def pump(s: WS.Session, c: WS.Closer, +tx: U32, +rx: U32, total: U32, single_cutoff: U32) -> IO(Unit):
   pump_progress(U32.is_eq((tx % 10000 : U32), 0), s, c, tx, rx, total, single_cutoff)
@@ -256,15 +288,20 @@ def challenge_bytes(xs: List<U32>, +value: U32, +count: U32) -> U32:
       value
     case Con{h, t}:
       challenge_bytes(t, (value * 256 + h : U32), (count + 1 : U32))
+def challenge_read(pair: File & List<U32>, s: WS.Session, kind: U32) -> IO(WS.Session & U32):
+  (h, bytes) = pair
+  do IO<WS.Session & U32>:
+    value : U32 = challenge_bytes(bytes, 0, 0)
+    code : U32 <- WS.Lease.release(WS.Lease{h})
+    check(kind, 0, 21)
+    check(code, 0, 22)
+    return (s, value)
 def challenge(s: WS.Session, r: WS.Receive) -> IO(WS.Session & U32):
   match r:
-    case WS.Payload{lease, WS.Message{kind, bytes}}:
+    case WS.Payload{WS.Lease{h}, WS.Message{kind, index, length}}:
       do IO<WS.Session & U32>:
-        value : U32 = challenge_bytes(bytes, 0, 0)
-        code : U32 <- WS.Lease.release(lease)
-        check(kind, 0, 21)
-        check(code, 0, 22)
-        return (s, value)
+        pair : File & List<U32> <- Fixture.lease_list(h, index)
+        challenge_read(pair, s, kind)
     case _:
       do IO<WS.Session & U32>:
         check(1, 0, 23)
@@ -452,19 +489,24 @@ def waiting_ready(s: WS.Session, c: WS.Closer, +index: U32) -> IO(Unit):
   do IO<Unit>:
     s0 : WS.Session <- take_n(s, index, 1n)
     waiting(U32.is_eq(index, 6), s0, c)
+def large_read(read: File & List<U32>, s: WS.Session, c: WS.Closer, kind: U32, +index: U32, +length: U32) -> IO(Unit):
+  (h, bytes) = read
+  do IO<Unit>:
+    check(validate_length(bytes, index, 1, 0, length), 0, 36)
+    check(kind, 0, 37)
+    s1 : WS.Session <- send_one(s, payload(U32.to_nat(length), index, 0, 0))
+    s2 : WS.Session <- flush_session(s1)
+    pair : U32 & U32 <- WS.close(s2, c)
+    close_checked(pair)
+    code : U32 <- WS.Lease.release(WS.Lease{h})
+    check(code, 0, 38)
+    checkpoint(5)
 def large_receive(s: WS.Session, c: WS.Closer, r: WS.Receive, +index: U32, +length: U32) -> IO(Unit):
   match r:
-    case WS.Payload{lease, WS.Message{kind, bytes}}:
+    case WS.Payload{WS.Lease{h}, WS.Message{kind, message_index, actual_length}}:
       do IO<Unit>:
-        check(validate_length(bytes, index, 1, 0, length), 0, 36)
-        check(kind, 0, 37)
-        s1 : WS.Session <- send_one(s, payload(U32.to_nat(length), index, 0, 0))
-        s2 : WS.Session <- flush_session(s1)
-        pair : U32 & U32 <- WS.close(s2, c)
-        close_checked(pair)
-        code : U32 <- WS.Lease.release(lease)
-        check(code, 0, 38)
-        checkpoint(5)
+        read : File & List<U32> <- Fixture.lease_list(h, message_index)
+        large_read(read, s, c, kind, index, length)
     case _:
       check(1, 0, 39)
 def large_pair(pair: WS.Session & WS.Receive, c: WS.Closer, index: U32, length: U32) -> IO(Unit):
@@ -550,16 +592,21 @@ def validate_text(xs: List<U32>) -> U32:
       ((a .^. 65) .|. b .|. (c .^. 226) .|. (d .^. 130) .|. (e .^. 172) : U32)
     case _:
       1
+def mixed_read(read: File & List<U32>, s: WS.Session, kind: U32) -> IO(WS.Session):
+  (h, bytes) = read
+  do IO<WS.Session>:
+    check(kind, 1, 76)
+    check(validate_text(bytes), 0, 77)
+    code : U32 <- WS.Lease.release(WS.Lease{h})
+    check(code, 0, 78)
+    return s
 def mixed_text(pair: WS.Session & WS.Receive) -> IO(WS.Session):
   (s, r) = pair
   match r:
-    case WS.Payload{lease, WS.Message{kind, bytes}}:
+    case WS.Payload{WS.Lease{h}, WS.Message{kind, index, length}}:
       do IO<WS.Session>:
-        check(kind, 1, 76)
-        check(validate_text(bytes), 0, 77)
-        code : U32 <- WS.Lease.release(lease)
-        check(code, 0, 78)
-        return s
+        read : File & List<U32> <- Fixture.lease_list(h, index)
+        mixed_read(read, s, kind)
     case _:
       do IO<WS.Session>:
         check(1, 0, 79)
@@ -627,18 +674,21 @@ def select_count(large: Bool) -> U32:
       check(1, 0, 62)
     case 1n+p:
       do IO<Unit>:
-        offered : WS.Session & WS.BatchAdmission <- WS.offer_batch(s, fill_messages(U32.is_eq(index, 23), sequence))
+        buffers : List<Bytes.Buffer> <- Fixture.from_lists(fill_messages(U32.is_eq(index, 23), sequence))
+        offered : WS.Session & WS.BatchAdmission <- WS.offer_batch(s, buffers)
         fill_result(offered, p, c, index, sequence)
 @unsafe def fill_result(pair: WS.Session & WS.BatchAdmission, n: Nat, c: WS.Closer, +index: U32, +sequence: U32) -> IO(Unit):
   (s, admission) = pair
   match admission:
-    case WS.BatchAccepted{+count}:
+    case WS.BatchAccepted{+count, messages}:
       do IO<Unit>:
+        Fixture.release_all(messages)
         check(count, fill_count(index), 63)
         fill_until_full(n, s, c, index, (sequence + count : U32))
     case WS.BatchFull{messages}:
       do IO<Unit>:
-        check(validate_rejected(messages, sequence, fill_length(index), fill_count(index)), 0, 64)
+        lists : List<List<U32>> <- Fixture.owned_lists(messages)
+        check(validate_rejected(lists, sequence, fill_length(index), fill_count(index)), 0, 64)
         s0 : WS.Session <- checked_status(s, sequence)
         s1 : WS.Session <- notify(s0, 0, 2, index, sequence)
         finish(s1, c, sequence, 1)
@@ -704,12 +754,10 @@ def length_large(large: Bool) -> U32:
 @unsafe def hold_received(pair: WS.Session & WS.Receive, n: Nat, +index: U32, +ordinal: U32) -> IO(WS.Session & List<WS.Lease>):
   (s, r) = pair
   match r:
-    case WS.Payload{lease, WS.Message{kind, bytes}}:
+    case WS.Payload{WS.Lease{h}, WS.Message{kind, message_index, length}}:
       do IO<WS.Session & List<WS.Lease>>:
-        check(kind, 0, 40)
-        check(validate_length(bytes, (30000 + index * 16 + ordinal : U32), 1, 0, lease_length(index)), 0, 41)
-        rest : WS.Session & List<WS.Lease> <- hold_n(n, s, index, (ordinal + 1 : U32))
-        return hold_join(rest, lease)
+        read : File & List<U32> <- Fixture.lease_list(h, message_index)
+        hold_read(read, s, n, kind, index, ordinal)
     case _:
       do IO<WS.Session & List<WS.Lease>>:
         check(1, 0, 42)
@@ -717,6 +765,13 @@ def length_large(large: Bool) -> U32:
 def hold_join(pair: WS.Session & List<WS.Lease>, lease: WS.Lease) -> WS.Session & List<WS.Lease>:
   (s, leases) = pair
   (s, lease <> leases)
+@unsafe def hold_read(read: File & List<U32>, s: WS.Session, n: Nat, kind: U32, +index: U32, +ordinal: U32) -> IO(WS.Session & List<WS.Lease>):
+  (h, bytes) = read
+  do IO<WS.Session & List<WS.Lease>>:
+    check(kind, 0, 40)
+    check(validate_length(bytes, (30000 + index * 16 + ordinal : U32), 1, 0, lease_length(index)), 0, 41)
+    rest : WS.Session & List<WS.Lease> <- hold_n(n, s, index, (ordinal + 1 : U32))
+    return hold_join(rest, WS.Lease{h})
 @unsafe def release_all(leases: List<WS.Lease>) -> IO(Unit):
   match leases:
     case Nil{}:
@@ -748,19 +803,24 @@ def hold_join(pair: WS.Session & List<WS.Lease>, lease: WS.Lease) -> WS.Session 
 @unsafe def lease_restored(pair: WS.Session & WS.Receive, leases: List<WS.Lease>, c: WS.Closer, +index: U32) -> IO(Unit):
   (s, r) = pair
   match r:
-    case WS.Payload{lease, WS.Message{kind, bytes}}:
+    case WS.Payload{WS.Lease{h}, WS.Message{kind, message_index, length}}:
       do IO<Unit>:
-        check(kind, 0, 47)
-        check(validate_length(bytes, (30000 + index * 16 + lease_count(index) : U32), 1, 0, restored_length(index)), 0, 48)
-        code : U32 <- WS.Lease.release(lease)
-        check(code, 0, 49)
-        closed : U32 & U32 <- WS.close(s, c)
-        close_checked(closed)
-        checkpoint(90)
-        release_all(leases)
-        checkpoint(6)
+        read : File & List<U32> <- Fixture.lease_list(h, message_index)
+        restored_read(read, s, leases, c, kind, index)
     case _:
       check(1, 0, 50)
+@unsafe def restored_read(read: File & List<U32>, s: WS.Session, leases: List<WS.Lease>, c: WS.Closer, kind: U32, +index: U32) -> IO(Unit):
+  (h, bytes) = read
+  do IO<Unit>:
+    check(kind, 0, 47)
+    check(validate_length(bytes, (30000 + index * 16 + lease_count(index) : U32), 1, 0, restored_length(index)), 0, 48)
+    code : U32 <- WS.Lease.release(WS.Lease{h})
+    check(code, 0, 49)
+    closed : U32 & U32 <- WS.close(s, c)
+    close_checked(closed)
+    checkpoint(90)
+    release_all(leases)
+    checkpoint(6)
 @unsafe def restored_length(index: U32) -> U32:
   restored_zero(U32.is_eq(index, 15))
 def restored_zero(zero: Bool) -> U32:
@@ -784,7 +844,8 @@ def restored_zero(zero: Bool) -> U32:
     case False{}:
       do IO<Unit>:
         inject(admission_fault(index))
-        pair : WS.Session & WS.Admission <- WS.offer(s, payload(256n, index, 0, 0))
+        buffer : Bytes.Buffer <- Fixture.from_list(payload(256n, index, 0, 0))
+        pair : WS.Session & WS.Admission <- WS.offer(s, buffer)
         panic_admission(pair, c, index)
 @unsafe def admission_fault(index: U32) -> U32:
   select_fault(U32.is_eq(index, 17))
@@ -797,8 +858,9 @@ def select_fault(post: Bool) -> U32:
 @unsafe def panic_admission(pair: WS.Session & WS.Admission, c: WS.Closer, +index: U32) -> IO(Unit):
   (s, admission) = pair
   match admission:
-    case WS.Accepted{}:
+    case WS.Accepted{bytes}:
       do IO<Unit>:
+        released : U32 <- Bytes.release(bytes)
         check(index, 17, 52)
         code : U32 <- WS.stop(c)
         check(code, 0, 53)
@@ -810,7 +872,8 @@ def select_fault(post: Bool) -> U32:
       do IO<Unit>:
         check(index, 18, 55)
         check(code, 10, 56)
-        check(validate(bytes, index, 0, 0), 0, 57)
+        list : List<U32> <- Fixture.owned_list(bytes)
+        check(validate(list, index, 0, 0), 0, 57)
         s0 : WS.Session <- send_one(s, payload(256n, index, 0, 0))
         finish(s0, c, 1, 1)
     case _:
@@ -886,20 +949,36 @@ def boundary_4(small: Bool) -> U32:
 @unsafe def lifecycle_received(pair: WS.Session & WS.Receive, c: WS.Closer, +port: U32, n: Nat) -> IO(Unit):
   (s, r) = pair
   match r:
-    case WS.Payload{lease, WS.Message{kind, bytes}}:
+    case WS.Payload{WS.Lease{h}, WS.Message{kind, index, length}}:
       do IO<Unit>:
-        check(kind, 0, 70)
+        read : File & List<U32> <- Fixture.lease_list(h, index)
+        lifecycle_read(read, s, c, kind, port, n)
+    case _:
+      check(1, 0, 73)
+@unsafe def lifecycle_read(read: File & List<U32>, s: WS.Session, c: WS.Closer, kind: U32, +port: U32, n: Nat) -> IO(Unit):
+  (h, bytes) = read
+  do IO<Unit>:
+    check(kind, 0, 70)
+    check(validate(bytes, 42, 1, 0), 0, 71)
+    s1 : WS.Session <- send_one(s, payload(256n, 42, 0, 0))
+    s2 : WS.Session <- flush_session(s1)
+    closed : U32 & U32 <- WS.close(s2, c)
+    close_checked(closed)
+    copied : File & Bytes.Allocation <- Bytes.copy_message(h, 0)
+    lifecycle_copied(copied, port, n)
+@unsafe def lifecycle_copied(pair: File & Bytes.Allocation, port: U32, n: Nat) -> IO(Unit):
+  (h, allocation) = pair
+  match allocation:
+    case Bytes.Allocated{words, length}:
+      do IO<Unit>:
+        bytes : List<U32> <- Fixture.owned_list(Bytes.ByteBuffer{words, length})
         check(validate(bytes, 42, 1, 0), 0, 71)
-        s1 : WS.Session <- send_one(s, payload(256n, 42, 0, 0))
-        s2 : WS.Session <- flush_session(s1)
-        closed : U32 & U32 <- WS.close(s2, c)
-        close_checked(closed)
-        code : U32 <- WS.Lease.release(lease)
+        code : U32 <- WS.Lease.release(WS.Lease{h})
         check(code, 0, 72)
         checkpoint(100)
         lifecycle(n, port)
-    case _:
-      check(1, 0, 73)
+    case Bytes.AllocationFailed{code}:
+      check(code, 0, 72)
 @unsafe def lifecycle_connected(r: WS.Start, port: U32, n: Nat) -> IO(Unit):
   match r:
     case WS.Started{s, c}:

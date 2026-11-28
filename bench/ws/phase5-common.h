@@ -26,8 +26,10 @@ typedef struct {
   uint64_t tx_done,peak,budget,high_bytes,high_count,begin_cpu,rx_due,rx_seq,rx_last,terminal_ns,tx_failed,rx_discarded;
   uint64_t incoming_start,outgoing_start,partial_reads,partial_writes,worker_evidence[9];
   uint64_t bend_allocations,c_allocations,bend_baseline,native_allocation_start,last_offer;
-  uint64_t terminal_rx_queue;
-  uint32_t size,id,port,sndbuf,rcvbuf,rx_epoch,allow_gaps,failure,fault_sequence,closing,offer_expired;
+   uint64_t terminal_rx_queue;
+   uint64_t rx_failure_sequence,rx_failure_expected,rx_failure_epoch;
+   uint32_t rx_failure_kind;
+   uint32_t size,id,port,sndbuf,rcvbuf,rx_epoch,allow_gaps,failure,fault_sequence,closing,offer_expired,rx_ready;
   uint32_t pending[4096],head,count;
   uint64_t last_sample[2],idle,baseline_fds,baseline_threads,pause_until,pause_rx,pause_tx,c_baseline;
   P5Facts tx[2],rx[2];
@@ -65,7 +67,7 @@ static void p5_barrier(uint64_t h) {
   p5.budget=s.native_budget;
   uint64_t live;if(ws_socket_fixture_memory(h,&p5.idle,&live)!=WS_OK)abort();
   puts("READY");fflush(stdout);if(scanf("%lu",&p5.start)!=1||p5.start<p5_now()+10000000)abort();
-  if(p5_env("WS_CYCLES",1)>1){uint64_t rate;if(scanf("%lu",&rate)!=1||!rate)abort();p5.rates[0]=rate;p5.rates[1]=rate;}
+   if(p5_env("WS_CYCLES",1)>1){uint64_t rate,pause_ms;if(scanf("%lu %lu",&rate,&pause_ms)!=2||!rate||pause_ms>1000)abort();p5.rates[0]=rate;p5.rates[1]=rate;p5.pause_ns=pause_ms*1000000;}
   p5.starts[0]=p5.start;p5.starts[1]=p5.start+p5.warm*P5_NS;p5.end=p5.starts[1]+p5.measure*P5_NS;
   p5.pause_until=p5.start+p5_env("WS_OBSERVED_PAUSE_MS",0)*1000000;
   p5.begin_cpu=p5_clock(CLOCK_PROCESS_CPUTIME_ID);
@@ -87,8 +89,9 @@ static void p5_payload(uint8_t *out,uint32_t e,uint32_t dir,uint64_t seq) {
   for(uint32_t i=56;i<p5.size;i++)out[i]=(p5.token+seq*17+i*31+dir*7+p5.id*13+e*19)&255;
 }
 static void p5_status(uint64_t h) {
-  WsSocketStatus s=ws_socket_status(h);
-  if(s.code!=WS_OK){p5.failure=1;return;}
+   WsSocketStatus s=ws_socket_status(h);
+   if(s.code!=WS_OK){p5.failure=1;return;}
+   p5.rx_ready=s.rx_count;
   if(ws_socket_fixture_evidence(h,p5.worker_evidence,9)!=WS_OK||p5.worker_evidence[8])abort();
   uint64_t sampled=p5_now();
   if(p5.worker_evidence[0]){if(!p5.terminal_ns)p5.incoming_start=sampled-p5.worker_evidence[0];p5.partial_reads++;}
@@ -138,7 +141,11 @@ static void p5_admission(uint32_t e,uint64_t seq,uint32_t accepted) {
 static int p5_rx_identity(const uint8_t *bytes,uint32_t n) {
   if(n!=p5.size||n<56){p5.failure=2;return 0;}
   uint64_t e=p5_get(bytes+16),seq=p5_get(bytes+40);
-  if(e>1||seq<p5.rx[e].next||(!p5.allow_gaps&&seq!=p5.rx[e].next)||seq>=p5_scheduled(e,1)){p5.failure=2;return 0;}
+   if(e>1||seq>=p5_scheduled(e,1)){p5.failure=2;return 0;}
+   if(seq<p5.rx[e].next||(!p5.allow_gaps&&seq!=p5.rx[e].next)){
+     if(!p5.rx_failure_kind){p5.rx_failure_kind=seq<p5.rx[e].next?2:1;p5.rx_failure_sequence=seq;p5.rx_failure_expected=p5.rx[e].next;p5.rx_failure_epoch=e;}
+     p5.failure=2;return 0;
+   }
   p5.rx_epoch=e;p5.rx_seq=seq;p5.rx_due=p5.starts[e]+seq*P5_NS/p5.rates[1];return 1;
 }
 static void p5_consumed(uint32_t valid) {
@@ -173,7 +180,8 @@ static void p5_report(uint64_t close_ns,uint64_t bend_live,uint64_t bend_peak,ui
   WsStats s=ws_native_stats();s.allocations-=p5.native_allocation_start;if(p5.offer_ns)p5.tx[1].missed=p5_scheduled(1,0)-p5.tx[1].attempted;uint32_t fds=p5_entries("/proc/self/fd"),threads=p5_entries("/proc/self/task");if(snprintf(p5_report_temporary,sizeof(p5_report_temporary),"%s.tmp",p5.report)>=sizeof(p5_report_temporary))abort();FILE*o=fopen(p5_report_temporary,"w");if(!o)abort();struct rusage r;if(getrusage(RUSAGE_SELF,&r))abort();
   fprintf(o,"{\"last_offer_ns\":%lu,",p5.last_offer);
   fprintf(o,"\"schema\":1,\"actor\":\"client\",\"bend_baseline\":%lu,\"pid\":%u,\"cycle\":%u,\"token\":%lu,\"start_ns\":%lu,\"end_ns\":%lu,\"finished_ns\":%lu,\"cpu_ticks\":%lu,\"cpu_ticks_per_second\":1000000000,\"queue_limit_bytes\":2097152,\"queue_limit_descriptors\":4096,\"histogram_overflow_us\":10000,\"failure\":",p5.bend_baseline,(unsigned)getpid(),p5_cycle,p5.token,p5.start,p5.end,p5_now(),p5_clock(CLOCK_PROCESS_CPUTIME_ID)-p5.begin_cpu);
-  if(p5.failure)fprintf(o,"{\"kind\":\"adapter\",\"code\":%u,\"sequence\":%u}",p5.failure,p5.fault_sequence);else fprintf(o,"null");
+   if(p5.rx_failure_kind)fprintf(o,"{\"kind\":\"%s\",\"direction\":1,\"connection\":%u,\"epoch\":%lu,\"sequence\":%lu,\"expected\":%lu}",p5.rx_failure_kind==1?"sequence":"duplicate",p5.id,p5.rx_failure_epoch,p5.rx_failure_sequence,p5.rx_failure_expected);
+   else if(p5.failure)fprintf(o,"{\"kind\":\"adapter\",\"code\":%u,\"sequence\":%u}",p5.failure,p5.fault_sequence);else fprintf(o,"null");
   fprintf(o,",\"resources\":{\"native_peak\":%lu,\"native_budget\":%lu,\"native_live\":%lu,\"layout_overflow\":%lu,\"worker_idle\":%lu,\"bend_live\":%lu,\"bend_peak\":%lu,\"c_live\":%lu,\"c_peak\":%lu,\"scratch_bytes\":%lu,\"rss_peak\":%lu,\"voluntary_switches\":%lu,\"involuntary_switches\":%lu,\"close_ns\":%lu,\"fds_restored\":%s,\"threads_restored\":%s,\"wake_errors\":%lu},\"streams\":[",p5.peak,p5.budget,s.live_bytes,s.layout_overflow,p5.idle,bend_live,bend_peak,c_live,c_peak,(uint64_t)sizeof(p5),r.ru_maxrss*1024ul,r.ru_nvcsw,r.ru_nivcsw,close_ns,fds==p5.baseline_fds?"true":"false",threads==p5.baseline_threads?"true":"false",s.wake_errors);
   for(uint32_t e=0;e<2;e++) {
     fprintf(o,"%s{\"connection\":%u,\"epoch\":%u,\"queue_highwater_bytes\":%lu,\"queue_highwater_descriptors\":%lu,\"sndbuf\":%u,\"rcvbuf\":%u,\"tx\":",e?",":"",p5.id,e,p5.high_bytes,p5.high_count,p5.sndbuf,p5.rcvbuf);

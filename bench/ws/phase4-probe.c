@@ -50,14 +50,14 @@ static Term phase4_checkpoint(Env e, Term *f, IoWork *w) {
   unsigned long virtual_pages, resident_pages;FILE*statm=fopen("/proc/self/statm","r");if(!statm||fscanf(statm,"%lu %lu",&virtual_pages,&resident_pages)!=2)abort();fclose(statm);
   if(f[0]!=100)printf("{\"kind\":\"rss\",\"tag\":%u,\"bytes\":%lu}\n",(u32)f[0],resident_pages*(unsigned long)sysconf(_SC_PAGESIZE));
   printf("{\"kind\":\"checkpoint\",\"tag\":%u,\"native_bytes\":%lu,\"native_blocks\":%lu,\"layout_overflow\":%lu,\"bend_bytes\":%lu,\"bend_blocks\":%lu,\"bend_peak\":%lu,\"c_bytes\":%lu,\"c_blocks\":%lu,\"c_peak\":%lu,\"fds\":%u,\"threads\":%u}\n",(u32)f[0],s.live_bytes,s.live_blocks,s.layout_overflow,atomic_load(&ws_bend_bytes),atomic_load(&ws_bend_blocks),atomic_load(&ws_bend_peak),ws_c_bytes,ws_c_blocks,ws_c_peak,fds,threads);
-  if(f[0]!=100) printf("{\"kind\":\"diagnostics\",\"tag\":%u,\"native_take_ns\":%lu,\"conversion_ns\":%lu,\"dispatch_ns\":%lu,\"dispatches\":%lu,\"single_sent\":%lu,\"batch_sent\":%lu,\"single_received\":%lu,\"batch_received\":%lu}\n",(u32)f[0],ws_copy_ns,ws_conversion_ns,ws_effect_ns,ws_effect_count,ws_single_sent,ws_batch_sent,ws_single_received,ws_batch_received);
+   if(f[0]!=100) printf("{\"kind\":\"diagnostics\",\"tag\":%u,\"native_take_ns\":%lu,\"fixture_bridge_conversion_ns\":%lu,\"dispatch_ns\":%lu,\"dispatches\":%lu,\"single_sent\":%lu,\"batch_sent\":%lu,\"single_received\":%lu,\"batch_received\":%lu}\n",(u32)f[0],ws_copy_ns,ws_conversion_ns,ws_effect_ns,ws_effect_count,ws_single_sent,ws_batch_sent,ws_single_received,ws_batch_received);
   return term_pak(CID(Unit),0);
 }
 typedef struct { uint32_t phase, direction, hold, sequence; uint64_t time; } WsPauseRecord;
 static Term phase4_notice(Env e, Term *f, IoWork *w) {
+  WsSocketStatus s = ws_socket_status(io_hand_v(f[0]));
   WsPauseRecord record = {(u32)f[1],(u32)f[2],(u32)f[3],(u32)f[4],ws_clock()};
   if (write(ws_observer_fd,&record,sizeof(record)) != sizeof(record)) abort();
-  WsSocketStatus s = ws_socket_status(io_hand_v(f[0]));
   printf("{\"kind\":\"pause\",\"phase\":%u,\"direction\":%u,\"hold\":%u,\"sequence\":%u,\"time\":%lu,\"admitted\":%lu,\"sent\":%lu,\"received\":%lu,\"consumed\":%lu,\"tx_bytes\":%u,\"tx_count\":%u,\"rx_bytes\":%u,\"rx_count\":%u,\"native_live\":%lu,\"native_budget\":%lu}\n",record.phase,record.direction,record.hold,record.sequence,record.time,s.tx_admitted,s.tx_complete,s.rx_complete,s.rx_consumed,s.tx_bytes,s.tx_count,s.rx_bytes,s.rx_count,s.native_live,s.native_budget);
   fflush(stdout);return f[0];
 }

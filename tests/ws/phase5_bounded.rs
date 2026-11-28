@@ -28,9 +28,25 @@ fn sufficient(t: &Trial, e: &Evidence, p: &Profile) -> Result<()> {
     Ok(())
 }
 
-fn reference_rejection_boundary(t: &Trial, e: &Evidence, p: &Profile) -> bool {
-    if t.path != PathKind::Reference || e.clients.len()!=1 || correctness(t,e,p,true).is_err() {return false;}
+fn rejection_boundary(t: &Trial, e: &Evidence, p: &Profile) -> bool {
+    if e.clients.len()!=1 || correctness(t,e,p,true).is_err() {return false;}
     let failure = &e.clients[0]["failure"];
+    let peer = &e.peer["failure"];
+    let transport_failure = if t.path==PathKind::Reference {failure["kind"]=="transport"} else {failure["kind"]=="adapter" && failure["code"]==22};
+    if transport_failure && peer["kind"]=="sequence" && peer["direction"]==0 {
+        let (Some(connection),Some(epoch),Some(expected),Some(sequence)) = (peer["connection"].as_u64(),peer["epoch"].as_u64(),peer["expected"].as_u64(),peer["sequence"].as_u64()) else {return false;};
+        return sequence>expected && row(&e.clients[0],connection as usize,epoch).is_ok_and(|stream| {
+            let rejected = n(&stream["tx"],"rejected").ok();
+            let accounted = if t.path==PathKind::Reference {rejected==Some(sequence-expected)} else {
+                rejected.is_some_and(|v|v>=sequence-expected)
+                    && stream["tx"]["rejections"].as_array().is_some_and(|ranges|ranges.iter().any(|range| {
+                        range[0].as_u64().is_some_and(|start|start<=expected)
+                            && range[1].as_u64().is_some_and(|end|end>=sequence)
+                    }))
+            };
+            n(stream,"queue_highwater_descriptors").ok()==Some(4096) && accounted
+        });
+    }
     if failure["kind"]!="sequence" || failure["direction"]!=1 || e.peer["failure"]["kind"]!="transport" {return false;}
     let (Some(connection),Some(epoch),Some(expected),Some(sequence)) = (failure["connection"].as_u64(),failure["epoch"].as_u64(),failure["expected"].as_u64(),failure["sequence"].as_u64()) else {return false;};
     if sequence<=expected {return false;}
@@ -38,6 +54,15 @@ fn reference_rejection_boundary(t: &Trial, e: &Evidence, p: &Profile) -> bool {
         n(stream,"queue_highwater_descriptors").ok()==Some(4096)
             && n(&stream["tx"],"rejected").is_ok_and(|v|v>=sequence-expected)
     })
+}
+
+fn boundary_outcome(t: &Trial, e: &Evidence, p: &Profile, gate: &std::result::Result<(),CapacityFailure>) -> Result<bool> {
+    match gate {
+        Ok(()) => Ok(true),
+        Err(CapacityFailure::Latency | CapacityFailure::Backlog) => Ok(false),
+        Err(CapacityFailure::Correctness(_)) if rejection_boundary(t,e,p) => Ok(false),
+        Err(error) => Err(format!("inconclusive: invalid capacity boundary evidence: {error}").into()),
+    }
 }
 
 impl Controller {
@@ -67,17 +92,11 @@ impl Controller {
                 let offered = if bracketed {low+(high-low)/2} else {high};
                 let (t,e) = self.run_case(path,case.clone(),offered,1,3)?;
                 let gate = capacity_gate(&t,&e,&self.profile,2000);
-                let passed = gate.is_ok();
                 let reason = gate.as_ref().err().map(ToString::to_string);
-                let capacity_failure = match &gate {
-                    Ok(()) => false,
-                    Err(CapacityFailure::Latency | CapacityFailure::Backlog) => true,
-                    Err(CapacityFailure::Correctness(_)) => reference_rejection_boundary(&t,&e,&self.profile),
-                    Err(CapacityFailure::Observation(_)) => false,
-                };
                 self.record(&t,&e,"fresh boundary probe, not qualification")?;
                 self.records.last_mut().ok_or("search record")?["gate_error"] = json!(reason);
                 save(&self.out.join("trials.json"),&json!(self.records))?;
+                let passed = boundary_outcome(&t,&e,&self.profile,&gate)?;
                 if passed {
                     low = offered;
                     if !bracketed {
@@ -87,7 +106,6 @@ impl Controller {
                         high = next;
                     }
                 } else {
-                    require(capacity_failure,&format!("inconclusive: invalid calibration evidence: {}",reason.unwrap_or_default()))?;
                     high = offered;
                     bracketed = true;
                 }
@@ -109,19 +127,44 @@ impl Controller {
         let mut boundary = [Boundary {low:0,high:0};3];
         for (i,path) in paths.into_iter().enumerate() {
             boundary[i] = self.bounded_search(path,case,None,spent)?;
+            boundary[i] = self.bounded_sustained_boundary(path,case,boundary[i])?;
         }
         let mut values: [Vec<u64>;3] = Default::default();
         let mut reference_boundaries = vec![];
-        for pair in 0..5 {
-            if pair > 0 {boundary[0] = self.bounded_search(PathKind::Reference,case,Some(boundary[0]),spent)?;}
-            reference_boundaries.push([boundary[0].low,boundary[0].high]);
-            for i in if pair%2 == 0 {[0,1,2]} else {[2,1,0]} {
-                let (t,e) = self.run_case(paths[i],case.clone(),boundary[i].low,5,20)?;
-                let gate = capacity_gate(&t,&e,&self.profile,2000).map_err(|e|e.into()).and_then(|_|sufficient(&t,&e,&self.profile));
-                self.bounded_record(&t,&e,"anchor capacity",gate)?;
-                values[i].push(rate(&t,&e)?);
+        let mut complete = false;
+        for refinement in 0..=n(&self.profile.raw,"qualification_refinements")? {
+            for v in &mut values {v.clear();}
+            reference_boundaries.clear();
+            let mut failed = None;
+            for pair in 0..5 {
+                if pair > 0 {
+                    let b = boundary[0];
+                    let low_pass = self.bounded_boundary_trial(PathKind::Reference,case,b.low)?;
+                    let high_pass = self.bounded_boundary_trial(PathKind::Reference,case,b.high)?;
+                    if !low_pass || high_pass {failed=Some(0);break;}
+                }
+                reference_boundaries.push([boundary[0].low,boundary[0].high]);
+                for i in if pair%2 == 0 {[0,1,2]} else {[2,1,0]} {
+                    let (t,e) = self.run_case(paths[i],case.clone(),boundary[i].low,5,20)?;
+                    let gate = capacity_gate(&t,&e,&self.profile,2000);
+                    let outcome = boundary_outcome(&t,&e,&self.profile,&gate);
+                    self.bounded_record(&t,&e,"anchor capacity",Ok(()))?;
+                    let record = self.records.last_mut().ok_or("paired record")?;
+                    record["gate_error"] = json!(gate.as_ref().err().map(ToString::to_string));
+                    record["refinement"] = json!(refinement);
+                    save(&self.out.join("trials.json"),&json!(self.records))?;
+                    if !outcome? {failed=Some(i);break;}
+                    sufficient(&t,&e,&self.profile)?;
+                    values[i].push(rate(&t,&e)?);
+                }
+                if failed.is_some() {break;}
             }
+            if let Some(i) = failed {
+                require(refinement<n(&self.profile.raw,"qualification_refinements")?,"inconclusive: sustained comparison drift after frozen refinement limit")?;
+                boundary[i]=self.bounded_sustained_boundary(paths[i],case,boundary[i])?;
+            } else {complete=true;break;}
         }
+        require(complete && values.iter().all(|v|v.len()==5),"five complete sustained comparison sets")?;
         let medians = [median(&values[0]),median(&values[1]),median(&values[2])];
         let lows = reference_boundaries.iter().map(|b|b[0]).collect::<Vec<_>>();
         let reference_spread = (reference_boundaries.iter().map(|b|b[1]).max().unwrap()-*lows.iter().min().unwrap()) as f64 / median(&lows) as f64;
@@ -158,6 +201,43 @@ impl Controller {
         }
         require(!self.records.iter().any(|r|r["verdict"] == "anchor capacity" && r["peer_cpu_fraction"].as_f64().is_some_and(|v|v>0.8)),"inconclusive: WebSocket peer CPU ceiling")?;
         Ok(medians)
+    }
+
+    fn bounded_boundary_trial(&mut self, path: PathKind, case: &Workload, offered: u64) -> Result<bool> {
+        let (t,e) = self.run_case(path,case.clone(),offered,5,20)?;
+        let gate = capacity_gate(&t,&e,&self.profile,2000);
+        let reason = gate.as_ref().err().map(ToString::to_string);
+        self.record(&t,&e,"sustained capacity boundary, not a paired sample")?;
+        let record = self.records.last_mut().ok_or("sustained boundary record")?;
+        record["gate_error"] = json!(reason);
+        record["warm_s"] = json!(t.warm);
+        record["measure_s"] = json!(t.measure);
+        save(&self.out.join("trials.json"),&json!(self.records))?;
+        let passed = boundary_outcome(&t,&e,&self.profile,&gate)?;
+        if passed {sufficient(&t,&e,&self.profile)?;}
+        Ok(passed)
+    }
+
+    fn bounded_sustained_boundary(&mut self, path: PathKind, case: &Workload, hint: Boundary) -> Result<Boundary> {
+        let mut low = 0;
+        let mut high = 0;
+        let mut offered = hint.low;
+        for _ in 0..n(&self.profile.raw,"search_max_steps")? {
+            if self.bounded_boundary_trial(path,case,offered)? {
+                low = offered;
+                if high == 0 {offered = if hint.high > offered {hint.high} else {offered + offered/4 + 1};}
+            } else {high = offered;}
+            if low > 0 && high > low {
+                if high-low <= (low/100).max(1) {
+                    save(&self.out.join(format!("sustained-boundary-{:04}.json",self.next_trial)),
+                        &json!({"path":format!("{path:?}"),"workload":format!("{case:?}"),"passing_rate":low,"failing_rate":high,"warm_s":5,"measure_s":20,"qualified_duration":true,"phase_pass":false}))?;
+                    return Ok(Boundary {low,high});
+                }
+                offered = low+(high-low)/2;
+            } else if high > 0 {offered = high*9/10;}
+            require(offered > 0 && offered <= n(&self.profile.raw,"search_ceiling_rate")?,"inconclusive: sustained capacity ceiling or zero rate")?;
+        }
+        Err("inconclusive: sustained capacity boundary search step limit".into())
     }
 
     fn bounded_cancellation_control(&mut self) -> Result<()> {
@@ -333,6 +413,90 @@ fn bound_assessment(report: &Value, assessment: &Value, root: &Path) -> Result<(
 #[ignore = "focused real-peer cancellation and process-group cleanup control"]
 fn phase5_cancellation_control() -> Result<()> {
     Controller::prepare(true)?.bounded_cancellation_control()
+}
+
+#[test]
+#[ignore = "focused real-actor limiter collection; no capacity or phase pass"]
+fn phase5_limiter_probe() -> Result<()> {
+    let mut c = Controller::prepare(false)?;
+    let case = Workload::W2 {connections:1,split:Rates {to_peer:1,to_application:1}};
+    let rates = [100000,100000,env::var("WS_PHASE5_RATE").map_or(Ok(30000),|v|v.parse::<u64>())?];
+    let missing = c.limiter_evidence(&case,rates)?;
+    save(&c.out.join("summary.json"),&json!({"scope":"diagnostic only","phase_pass":false,"offered_rates":rates,"missing":missing,"trials":c.records}))
+}
+
+#[test]
+#[ignore = "one selected path's sustained boundary; no paired ratio or phase pass"]
+fn phase5_sustained_probe() -> Result<()> {
+    let path = match env::var("WS_PHASE5_PATH")?.as_str() {
+        "Reference" => PathKind::Reference,
+        "Native" => PathKind::Native,
+        "Bend" => PathKind::Bend,
+        _ => return Err("WS_PHASE5_PATH must be Reference, Native, or Bend".into()),
+    };
+    let low = env::var("WS_PHASE5_RATE")?.parse::<u64>()?;
+    require(low>0,"positive sustained probe rate")?;
+    let mut c = Controller::prepare(false)?;
+    let case = Workload::W2 {connections:1,split:Rates {to_peer:1,to_application:1}};
+    let b = c.bounded_sustained_boundary(path,&case,Boundary {low,high:low+low/4+1})?;
+    save(&c.out.join("summary.json"),&json!({"scope":"single sustained boundary","phase_pass":false,"path":format!("{path:?}"),"passing_rate":b.low,"failing_rate":b.high,"trials":c.records}))
+}
+
+#[test]
+#[ignore = "real retained rejection boundary and evidence-damage controls without new traffic"]
+fn phase5_rejection_evidence() -> Result<()> {
+    let dir = PathBuf::from(env::var_os("WS_PHASE5_EVIDENCE").ok_or("WS_PHASE5_EVIDENCE required")?).canonicalize()?;
+    let meta: Value = serde_json::from_slice(&fs::read(dir.join("trial.json"))?)?;
+    let path = match meta["path"].as_str() {Some("Reference")=>PathKind::Reference,Some("Native")=>PathKind::Native,Some("Bend")=>PathKind::Bend,_=>return Err("rejection evidence path".into())};
+    let t = Trial {path,workload:Workload::W2 {connections:1,split:Rates {to_peer:1,to_application:1}},rates:rates(&meta["rates"])? ,warm:n(&meta,"warm")?,measure:n(&meta,"measure")?,token:n(&meta,"token")?,start:n(&meta,"start")?,tcp:false,fault:false};
+    let trials: Value = serde_json::from_slice(&fs::read(dir.parent().ok_or("campaign directory")?.join("trials.json"))?)?;
+    let record = trials.as_array().ok_or("trial records")?.iter().find(|r|r["evidence"]==dir.to_string_lossy().as_ref()).ok_or("recorded actor statuses")?;
+    let mut e = Evidence {clients:vec![serde_json::from_slice(&fs::read(dir.join("client-0.json"))?)?],peer:serde_json::from_slice(&fs::read(dir.join("peer.json"))?)?,statuses:serde_json::from_value(record["statuses"].clone())?,directory:dir};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let profile = Profile {raw:serde_json::from_slice(&fs::read(root.join("bench/ws/profiles/local-perf-v2.json"))?)?,cpus:[0,1]};
+    require(rejection_boundary(&t,&e,&profile),"accounted real rejection not recognized")?;
+    let original = e.clients[0].clone();
+    let original_peer = e.peer.clone();
+    for damage in ["rejections","queue","failure","token","count"] {
+        e.clients[0]=original.clone();e.peer=original_peer.clone();
+        match damage {
+            "rejections" => for actor in [&mut e.clients[0],&mut e.peer] {for stream in actor["streams"].as_array_mut().ok_or("streams")? {stream["tx"]["rejected"]=json!(0);stream["tx"]["rejections"]=json!([]);}},
+            "queue" => for actor in [&mut e.clients[0],&mut e.peer] {for stream in actor["streams"].as_array_mut().ok_or("streams")? {stream["queue_highwater_descriptors"]=json!(1);}},
+            "failure" => e.clients[0]["failure"]["kind"]=json!("unaccounted"),
+            "count" => e.clients[0]["streams"][1]["rx"]["validated"]=json!(u64::MAX),
+            _ => e.clients[0]["token"]=json!(0),
+        }
+        require(!rejection_boundary(&t,&e,&profile),&format!("damaged {damage} established boundary"))?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "five paired dense-versus-baseline Bend trials on the same endpoint CPU budget"]
+fn phase5_dense_comparison() -> Result<()> {
+    let baseline = PathBuf::from(env::var_os("WS_PHASE5_BASELINE_DIR").ok_or("WS_PHASE5_BASELINE_DIR required")?).canonicalize()?;
+    let manifest:Value = serde_json::from_slice(&fs::read(baseline.join("complete.json"))?)?;
+    let artifacts = [baseline.join("uws-reference"),baseline.join("phase5-native"),baseline.join("bend-phase5")];
+    require(manifest["artifacts"]==checksums(&artifacts)?,"baseline artifact identity changed")?;
+    let marker = manifest["identity"]["marker"].as_str().ok_or("baseline build marker")?;
+    require(fs::read(&artifacts[2])?.windows(marker.len()).any(|b|b==marker.as_bytes()),"baseline actor does not match recorded native build")?;
+    let mut c = Controller::prepare(false)?;
+    let candidate = c.bend.clone();
+    let mut pairs = vec![];
+    for pair in 0..5 {
+        let token = now();
+        let mut trials = vec![];
+        for version in if pair%2==0 {["baseline","dense"]} else {["dense","baseline"]} {
+            c.bend = if version=="baseline" {artifacts[2].clone()} else {candidate.clone()};
+            let (t,e) = c.trial(Trial {path:PathKind::Bend,workload:Workload::W2 {connections:1,split:Rates {to_peer:1,to_application:1}},rates:Rates {to_peer:12000,to_application:12000},warm:5,measure:20,token,start:0,tcp:false,fault:false})?;
+            let gate = capacity_gate(&t,&e,&c.profile,2000).map_err(|e|e.into()).and_then(|_|sufficient(&t,&e,&c.profile));
+            c.bounded_record(&t,&e,&format!("{version} paired fixed-load Bend comparison"),gate)?;
+            trials.push(json!({"version":version,"evidence":e.directory,"stream_p99_us":streams(&t,&e,1)?.iter().map(|s|p99(s.rx,"latency_histogram_us",n(s.rx,"validated").unwrap_or(0))).collect::<Result<Vec<_>>>()?,"client_cpu_ns":e.clients[0]["cpu_ticks"],"resources":e.clients[0]["resources"]}));
+        }
+        pairs.push(json!({"pair":pair,"token":token,"trials":trials}));
+        save(&c.out.join("comparison.json"),&json!({"scope":"paired fixed-load message-path comparison, not capacity qualification","offered_per_direction":12000,"warm_s":5,"measure_s":20,"baseline_manifest":baseline.join("complete.json"),"baseline_actor":artifacts[2],"dense_actor":candidate,"phase_pass":false,"pairs":pairs}))?;
+    }
+    save(&c.out.join("summary.json"),&json!({"scope":"paired dense Bend message-path comparison","comparison_pass":true,"phase_pass":false,"pairs":pairs,"baseline_manifest":baseline.join("complete.json"),"fixture_identity":"build/identity.json"}))
 }
 
 #[test]

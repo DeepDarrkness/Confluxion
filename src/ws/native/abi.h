@@ -28,6 +28,8 @@ enum { WS_HEAD_TOO_LARGE = 24, WS_OVERSIZE = 25 };
 typedef struct { uint32_t kind, offset, len, reserved; } WsMessageSpan;
 typedef struct { uint32_t port, host_len, target_len, protocol_len; const uint8_t *host, *target, *protocol; } WsEndpoint;
 typedef struct { uint32_t code, accepted; } WsBatchAdmission;
+typedef struct { const uint8_t *bytes; uint32_t len, kind; } WsBuffer;
+typedef struct { const uint8_t *bytes; uint32_t code, len, kind, reserved; } WsByteView;
 typedef struct { uint64_t lease; uint32_t code, count, bytes_len, terminal; const uint8_t *bytes; const WsMessageSpan *messages; } WsBatchTake;
 typedef struct {
   uint32_t code, state, terminal, reserved;
@@ -40,6 +42,9 @@ WsStart ws_socket_connect_begin(const WsEndpoint*);
 WsWait ws_socket_connect_wait(uint64_t);
 uint32_t ws_socket_connect_finish(uint64_t);
 WsBatchAdmission ws_socket_offer_batch(uint64_t, const WsMessageSpan*, uint32_t, const uint8_t*, uint32_t);
+WsBatchAdmission ws_socket_offer_buffer(uint64_t, const uint8_t*, uint32_t);
+WsBatchAdmission ws_socket_offer_buffers(uint64_t, const WsBuffer*, uint32_t);
+WsByteView ws_socket_lease_view(uint64_t, uint32_t);
 WsBatchTake ws_socket_take_batch(uint64_t, uint32_t, uint32_t);
 WsWait ws_socket_wait_begin(uint64_t);
 uint32_t ws_socket_wait_end(uint64_t);
@@ -48,4 +53,5 @@ WsSocketStatus ws_socket_status(uint64_t);
 WsWait ws_socket_stop_begin(uint64_t, uint32_t);
 uint32_t ws_socket_stop_finish(uint64_t, uint32_t);
 _Static_assert(sizeof(WsMessageSpan) == 16 && sizeof(WsBatchTake) == 40 && sizeof(WsSocketStatus) == 144, "socket ABI layout");
+_Static_assert(sizeof(WsBuffer) == 16 && sizeof(WsByteView) == 24, "dense socket ABI layout");
 #endif

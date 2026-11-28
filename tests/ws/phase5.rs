@@ -307,7 +307,10 @@ fn correctness(t: &Trial, e: &Evidence, profile: &Profile, adverse: bool) -> Res
             let admitted = n(s.tx, "admitted")?;
             let transmitted = n(s.tx, "transmitted")?;
             let received = n(s.rx, "validated")?;
-            require(admitted+n(s.tx,"rejected")?==attempted && transmitted<=admitted && received<=transmitted,&format!("admission != delivery accounting: attempted={attempted} admitted={admitted} transmitted={transmitted} validated={received}"))?;
+            // A failed library flush can transmit a complete prefix before draining its buffer.
+            let flush_prefix = adverse && (t.path == PathKind::Reference || !s.to_peer);
+            let receive_ceiling = if flush_prefix {admitted} else {transmitted};
+            require(admitted+n(s.tx,"rejected")?==attempted && transmitted<=admitted && received<=receive_ceiling,&format!("admission != delivery accounting: attempted={attempted} admitted={admitted} transmitted={transmitted} validated={received}"))?;
             if !adverse {
                 require(
                     attempted == count
@@ -499,7 +502,7 @@ fn input_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             if !matches!(path.file_name().and_then(|s|s.to_str()), Some(".git" | "target")) {
                 input_files(&path, files)?;
             }
-        } else if path.extension().is_some_and(|s| matches!(s.to_str(), Some("c" | "cpp" | "h" | "hpp" | "bend" | "js"))) {
+        } else if path.extension().is_some_and(|s| matches!(s.to_str(), Some("c" | "cpp" | "h" | "hpp" | "bend" | "js" | "rs" | "toml"))) {
             files.push(path);
         }
     }
@@ -684,7 +687,7 @@ impl Controller {
     }
     fn build(&mut self) -> Result<()> {
         let clang = Path::new("/usr/lib/llvm-19/bin/clang");
-        let bend = self.cache.join("bend/bin/bend");
+        let bend = env::var_os("BEND").map(PathBuf::from).unwrap_or_else(|| self.cache.join("bend/bin/bend"));
         let mut c = Command::new(&bend);
         c.arg("version");
         require(
@@ -719,8 +722,8 @@ impl Controller {
         let recipe = runner.split_once("\n    fn build_command(").ok_or("fixture recipe source anchor")?.1.split_once("\n    fn actor_command(").ok_or("fixture recipe end anchor")?.0;
         let recipe_key = content_key(recipe.as_bytes())?;
         let mut files = vec![archive.clone(),bend.clone(),clang.canonicalize()?,self.root.join("Cargo.lock"),PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.a"),PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a")];
-        for name in ["reference-native/main.cpp","reference-native/allocator.cpp","phase5-native.c","phase5-common.h","bend-phase5.bend","phase5-probe.c","phase5-probe.js"] {files.push(self.root.join("bench/ws").join(name));}
-        for directory in [self.root.join("src/ws"),self.cache.join("uSockets/src"),self.cache.join("uWebSockets/src"),self.cache.join("bend/bend2")] {
+        for name in ["reference-native/main.cpp","reference-native/allocator.cpp","phase5-native.c","phase5-common.h","bend-phase5.bend","phase5-schema.bend","phase5-probe.c","phase5-probe.js"] {files.push(self.root.join("bench/ws").join(name));}
+        for directory in [self.root.join("src/ws"),self.root.join("src/bytes"),self.root.join("tools/bend-codec"),self.cache.join("uSockets/src"),self.cache.join("uWebSockets/src"),self.cache.join("bend/bend2")] {
             input_files(&directory, &mut files)?;
         }
         files.sort();
@@ -746,7 +749,10 @@ impl Controller {
         self.peer = self.build_dir.join("uws-reference");
         self.native = self.build_dir.join("phase5-native");
         self.bend = self.build_dir.join("bend-phase5");
-        let binaries = vec![self.peer.clone(),self.native.clone(),self.bend.clone()];
+        let codec_dir = self.build_dir.join("phase5-codec");
+        let mut binaries = vec![self.peer.clone(),self.native.clone(),self.bend.clone()];
+        for name in ["codec.bend","codec.c","codec.js","contract.json"] {binaries.push(codec_dir.join(name));}
+        binaries.push(self.build_dir.join("bend-phase5.bend"));
         let complete = self.build_dir.join("complete.json");
         let reused = fs::read(&complete).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok())
             .is_some_and(|v|v["identity"]==identity && checksums(&binaries).is_ok_and(|s|v["artifacts"]==s));
@@ -754,6 +760,16 @@ impl Controller {
         println!("Phase 5 fixture cache {}: {key}",if reused {"hit"} else {"miss"});
         if reused {return Ok(());}
         if complete.exists() {fs::remove_file(&complete)?;}
+        let schema = bend_codec::load(&self.root.join("bench/ws/phase5-schema.bend"), &["Frame".into()], bend_codec::Format::RawBe)?;
+        let outputs = bend_codec::generate(&schema, &codec_dir);
+        bend_codec::write_outputs(&codec_dir, &outputs)?;
+        let fixture = fs::read_to_string(self.root.join("bench/ws/bend-phase5.bend"))?
+            .replace("../../src/", "../../../src/")
+            .replace("./phase5-schema.bend", "../../../bench/ws/phase5-schema.bend")
+            .replace("\"./phase5-probe.c\"", "\"../../../bench/ws/phase5-probe.c\"")
+            .replace("\"./phase5-probe.js\"", "\"../../../bench/ws/phase5-probe.js\"");
+        fs::write(self.build_dir.join("bend-phase5.bend"), fixture)?;
+        save(&self.build_dir.join("codec-recipe.json"), &json!({"schema":"bench/ws/phase5-schema.bend","roots":["Frame"],"format":"raw-be","generator":"bend_codec::generate/write_outputs","fixture_import_rewrite":"target/ws-fixtures/<input-key> to repository sources; codec remains ./phase5-codec/codec.bend","artifacts":checksums(&binaries[3..])?}))?;
         let mut sources = vec![];
         for d in ["src", "src/eventing", "src/crypto", "src/io_uring"] {
             for e in fs::read_dir(self.cache.join("uSockets").join(d))? {
@@ -826,7 +842,7 @@ impl Controller {
         self.build_command(c, "native")?;
         let original = self.build_dir.join("original.c");
         let mut c = Command::new(&bend);
-        c.arg("bench/ws/bend-phase5.bend").arg("-o").arg(&original);
+        c.arg(self.build_dir.join("bend-phase5.bend")).arg("-o").arg(&original);
         self.build_command(c, "emit")?;
         let source = self.build_dir.join("instrumented.c");
         fs::write(&source, instrument(fs::read_to_string(original)?)?)?;
@@ -834,6 +850,8 @@ impl Controller {
         c.args(["-O2", "-g", "-std=c11", "-DBEND_POISON"])
             .arg("-I")
             .arg(self.root.join("src/ws/native"))
+            .arg("-I")
+            .arg(self.root.join("src/bytes"))
             .arg("-I")
             .arg(self.root.join("bench/ws"))
             .arg(source)
@@ -1462,7 +1480,8 @@ impl Controller {
                 .enumerate()
             {
                 self.diagnostic = Some(tool);
-                let run = self.run_case(path, workload.clone(), capacities[index], 0, 1);
+                let offered = if tool == "strace" {capacities[index].min(1000)} else {capacities[index]};
+                let run = self.run_case(path, workload.clone(), offered, 0, 5);
                 self.diagnostic = None;
                 match run {
                     Ok((t, e)) => {
@@ -2052,7 +2071,8 @@ impl Controller {
         t.start = now() + 100_000_000;
         send.send(t.start)?;
         if persistent {
-            writeln!(actor.child.stdin.as_mut().ok_or("stdin")?, "{} {}", t.start, rate)?;
+            let receive_pause = if disconnect {1000} else if receiver == 1 {pause_ms} else {0};
+            writeln!(actor.child.stdin.as_mut().ok_or("stdin")?, "{} {} {}", t.start, rate, receive_pause)?;
         } else {actor.barrier(t.start)?;}
         let deadline = Instant::now() + Duration::from_secs(5);
         let status = if !persistent {actor.wait(deadline)?} else {
@@ -2228,7 +2248,7 @@ fn replace(c: &mut String, from: &str, to: &str) -> Result<()> {
 }
 fn instrument(mut c: String) -> Result<String> {
     replace(&mut c, "static Term ws_offer_run(Env e, Term *f, IoWork *w) {", "static int p5_offer_open(void);\nstatic Term ws_offer_run(Env e, Term *f, IoWork *w) {")?;
-    replace(&mut c, "if (code == WS_OK) a = ws_socket_offer_batch(io_hand_v(f[0]), &span, 1, bytes, n);", "if (code == WS_OK && p5_offer_open()) a = ws_socket_offer_batch(io_hand_v(f[0]), &span, 1, bytes, n);")?;
+    replace(&mut c, "if (code == WS_OK) a = ws_socket_offer_buffer(io_hand_v(f[0]), bytes, f[2]);", "if (code == WS_OK && p5_offer_open()) a = ws_socket_offer_buffer(io_hand_v(f[0]), bytes, f[2]);")?;
     let hooks = r#"
 static _Atomic uint64_t ws_bend_blocks,ws_bend_bytes,ws_bend_peak,ws_bend_allocations;
 static unsigned char ws_bend_owned[1u<<24];
@@ -2276,6 +2296,14 @@ fn phase5_bend_four_connections() -> Result<()> {
     Controller::prepare(true)?.routine_duplex(PathKind::Bend,4)
 }
 #[test]
+fn phase5_bend_partial_word() -> Result<()> {
+    let mut c = Controller::prepare(true)?;
+    let (t,e) = c.run_case(PathKind::Bend,Workload::W1 {bytes:259,split:Rates {to_peer:1,to_application:1}},100,0,1)?;
+    correctness(&t,&e,&c.profile,false)?;
+    c.record(&t,&e,"routine 259-byte packed partial-word duplex")?;
+    c.routine_summary("Bend partial-word body encoding and full-byte validation")
+}
+#[test]
 fn phase5_evidence_controls() -> Result<()> {
     Controller::prepare(true)?.routine_controls()
 }
@@ -2283,7 +2311,6 @@ fn phase5_evidence_controls() -> Result<()> {
 fn phase5_native_overload_lifecycle() -> Result<()> {
     let mut c = Controller::prepare(true)?;
     c.scripted(PathKind::Native,100,1,5000,false)?;
-    c.qualification_running = true;
     c.lifecycle(PathKind::Native,50000,1,0)?;
     c.routine_summary("Native scoped overload and same-process normal/disconnect cleanup")
 }
@@ -2291,7 +2318,6 @@ fn phase5_native_overload_lifecycle() -> Result<()> {
 fn phase5_bend_overload_lifecycle() -> Result<()> {
     let mut c = Controller::prepare(true)?;
     c.scripted(PathKind::Bend,100,1,5000,false)?;
-    c.qualification_running = true;
     c.lifecycle(PathKind::Bend,50000,1,0)?;
     c.routine_summary("Bend scoped overload and same-process normal/disconnect cleanup")
 }

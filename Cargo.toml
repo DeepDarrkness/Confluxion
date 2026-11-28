@@ -1,5 +1,5 @@
 [workspace]
-members = ["bench/ws/reference-rs", "src/ws/native"]
+members = ["bench/ws/reference-rs", "src/ws/native", "tools/bend-codec"]
 resolver = "2"
 
 [profile.release]

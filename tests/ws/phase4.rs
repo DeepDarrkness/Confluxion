@@ -55,10 +55,6 @@ static int ws_armed, ws_observer_fd;
 static u64 ws_copy_ns, ws_conversion_ns, ws_effect_ns, ws_effect_count;
 static u64 ws_single_sent, ws_batch_sent, ws_single_received, ws_batch_received;
 static u64 ws_observed_budget;
-static Term ws_convert(Env e, const char *bytes, u32 n) {
-  u64 start = ws_clock(); Term value = io_list(e, bytes, n);
-  ws_conversion_ns += ws_clock() - start; return value;
-}
 "#;
     replace(
         &mut c,
@@ -78,12 +74,15 @@ static Term ws_convert(Env e, const char *bytes, u32 n) {
     );
     replace(&mut c, "    Term x  = io_eff_rows[c](e, fs, a);", "    ws_dispatches++;\n    u64 effect_start = ws_clock();\n    Term x  = io_eff_rows[c](e, fs, a);\n    ws_effect_ns += ws_clock() - effect_start; ws_effect_count++;");
     replace(&mut c, "typedef struct { u64 closer, deadline; u32 count, bytes, batch, failure; } WsEffectState;", "#define malloc ws_malloc\n#define calloc ws_calloc\n#define free ws_free\ntypedef struct { u64 closer, deadline; u32 count, bytes, batch, failure; } WsEffectState;");
-    replace(&mut c, "  WsBatchTake r = ws_socket_take_batch(w->hand, state->count, state->bytes);", "  u64 copy_start = ws_clock();\n  WsBatchTake r = ws_socket_take_batch(w->hand, state->count, state->bytes);\n  WsSocketStatus memory = ws_socket_status(w->hand);\n  if(memory.code == WS_OK) {ws_observed_budget = memory.native_budget; if(memory.native_peak > memory.native_budget)abort();}\n  ws_copy_ns += ws_clock() - copy_start;\n  if(r.code == WS_OK) { if(state->batch)ws_batch_received += r.count;else ws_single_received += r.count; }");
+    replace(&mut c, "  WsBatchTake r = ws_socket_take_batch(w->hand, state->count, state->bytes);", "  u64 copy_start = ws_clock();\n  WsBatchTake r = ws_socket_take_batch(w->hand, state->count, state->bytes);\n  WsSocketStatus memory = ws_socket_status(w->hand);\n  if(memory.code == WS_OK) {ws_observed_budget = memory.native_budget; if(memory.native_peak > memory.native_budget)abort();}\n  ws_copy_ns += ws_clock() - copy_start;\n  if(r.code == WS_OK) { WsByteView view = ws_socket_lease_view(r.lease,0); if(view.code || view.bytes != r.bytes || view.len != r.messages[0].len || view.kind != r.messages[0].kind)abort(); if(ws_socket_lease_view(r.lease,r.count).code != WS_INVALID || ws_socket_lease_view(w->hand,0).code != WS_ROLE)abort(); if(state->batch)ws_batch_received += r.count;else ws_single_received += r.count; }");
     replace(
         &mut c,
-        "io_list(e, (char*)r.bytes + span.offset, span.len)",
-        "ws_convert(e, (char*)r.bytes + span.offset, span.len)",
+        "  Term list = io_list(e, (char*)view.bytes, view.len);",
+        "  u64 conversion_start = ws_clock();\n  Term list = io_list(e, (char*)view.bytes, view.len);\n  ws_conversion_ns += ws_clock() - conversion_start;",
     );
+    replace(&mut c, "  Term list = io_list(e, (char*)bytes, n);", "  u64 conversion_start = ws_clock();\n  Term list = io_list(e, (char*)bytes, n);\n  ws_conversion_ns += ws_clock() - conversion_start;");
+    replace(&mut c, "  Term list = f[0]; uint32_t n = 0;", "  u64 conversion_start = ws_clock();\n  Term list = f[0]; uint32_t n = 0;");
+    replace(&mut c, "  Term fields[] = {array, n};", "  ws_conversion_ns += ws_clock() - conversion_start;\n  Term fields[] = {array, n};");
     replace(
         &mut c,
         "  if (a.accepted == 1) {",
@@ -91,15 +90,15 @@ static Term ws_convert(Env e, const char *bytes, u32 n) {
     );
     replace(
         &mut c,
-        "  if (a.code == WS_OK) {",
-        "  if (a.code == WS_OK) {\n    ws_batch_sent += a.accepted;",
+        "  if (a.code == WS_OK) return io_tup(e, f[0], io_node(e,",
+        "  if (a.code == WS_OK) ws_batch_sent += a.accepted;\n  if (a.code == WS_OK) return io_tup(e, f[0], io_node(e,",
     );
     replace(&mut c, "static Term ws_release_run(Env e, Term *f, IoWork *w) { return ws_socket_release(io_hand_v(f[0])); }", r#"static Term ws_release_run(Env e, Term *f, IoWork *w) {
   static u64 previous;
   if(getenv("WS_OMIT_RELEASE"))return WS_OK;
   if(previous) {u32 old=ws_socket_release(previous);if(old!=WS_CLOSED&&old!=WS_STALE)abort();}
   u64 h=io_hand_v(f[0]);u32 code=ws_socket_release(h);
-  if(code==WS_OK) {if(ws_socket_release(h)!=WS_CLOSED)abort();previous=h;}
+  if(code==WS_OK) {if(ws_socket_release(h)!=WS_CLOSED || ws_socket_lease_view(h,0).code!=WS_CLOSED)abort();previous=h;}
   return code;
 }"#);
     replace(&mut c,"  u32 code = ws_socket_stop_finish(w->hand, w->size);","  u32 code = ws_socket_stop_finish(w->hand, w->size);\n  if(code == WS_OK && ws_socket_stop_begin(w->hand,w->size).code != WS_CLOSED)abort();");
@@ -891,6 +890,105 @@ impl QualificationProfile {
     }
 }
 
+fn fixture_inputs(directory: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            if !matches!(path.file_name().and_then(|s| s.to_str()), Some(".git" | "target")) {
+                fixture_inputs(&path, files);
+            }
+        } else if path.extension().is_some_and(|s| matches!(s.to_str(), Some("c" | "cpp" | "h" | "hpp" | "bend" | "js" | "rs" | "toml"))) {
+            files.push(path);
+        }
+    }
+}
+fn fixture_checksums(files: &[PathBuf]) -> String {
+    let output = Command::new("sha256sum").arg("--").args(files).output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+fn fixture_key(bytes: &[u8]) -> String {
+    let mut child = Command::new("sha256sum").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().split_whitespace().next().unwrap().into()
+}
+struct FixtureBuild {
+    binary: PathBuf,
+    source: PathBuf,
+    archive: PathBuf,
+    legacy: PathBuf,
+    peer: PathBuf,
+    sanitizer: PathBuf,
+}
+fn fixture_build(root: &Path, cache: &Path, out: &Path, full: bool) -> FixtureBuild {
+    let bend = env::var_os("BEND").map(PathBuf::from).unwrap_or_else(|| cache.join("bend/bin/bend"));
+    let clang = PathBuf::from("/usr/lib/llvm-19/bin/clang");
+    let marker = confluxion_ws_native::build_marker();
+    let deps = env::current_exe().unwrap().parent().unwrap().to_owned();
+    let mut archives: Vec<_> = fs::read_dir(deps).unwrap().map(|e|e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x|x=="a") && p.file_name().unwrap().to_string_lossy().starts_with("libconfluxion_ws_native-"))
+        .filter(|p|fs::read(p).unwrap().windows(marker.len()).any(|b|b==marker.as_bytes())).collect();
+    archives.sort();
+    let archive = archives.first().expect("current native archive").clone();
+    let mut files = vec![archive.clone(),bend.clone(),clang.canonicalize().unwrap(),root.join("Cargo.lock"),PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.a"),PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a")];
+    for name in ["bend-phase4.bend","phase4-probe.c","phase4-probe.js","fixture-bytes.bend","fixture-bytes.c","fixture-bytes.js","phase3-peer.cpp"] {files.push(root.join("bench/ws").join(name));}
+    for directory in [root.join("src/ws"),root.join("src/bytes"),cache.join("uSockets/src"),cache.join("uWebSockets/src"),cache.join("bend/bend2")] {fixture_inputs(&directory,&mut files);}
+    files.sort(); files.dedup();
+    let runner = fs::read_to_string(root.join("tests/ws/phase4.rs")).unwrap();
+    let instrumentation = runner.split_once("fn replace(").unwrap().1.split_once("struct Process(").unwrap().0;
+    let builder = runner.split_once("fn build_peer(").unwrap().1.split_once("fn child(").unwrap().0;
+    let recipe = runner.split_once("fn fixture_inputs(").unwrap().1.split_once("#[test]").unwrap().0;
+    let identity = json!({"schema":1,"marker":marker,"inputs":fixture_checksums(&files),"instrument":fixture_key(instrumentation.as_bytes()),"peer_builder":fixture_key(builder.as_bytes()),"recipe":fixture_key(recipe.as_bytes()),"sanitizer":full,"flags":"Bend 2.0.40; clang19; actors -O2 -g -std=c11 -DBEND_POISON -I src/ws/native -I src/bytes -lpthread -lm -ldl; legacy -O2; sanitizer -O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer; peer flags from build_peer"});
+    let key = fixture_key(&serde_json::to_vec(&identity).unwrap());
+    let base = root.join("target/ws-fixtures"); fs::create_dir_all(&base).unwrap();
+    let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(base.join(format!("phase4-{key}.lock"))).unwrap();
+    assert_eq!(unsafe {libc::flock(lock.as_raw_fd(),libc::LOCK_EX)},0);
+    let build = base.join(format!("phase4-{key}")); fs::create_dir_all(&build).unwrap();
+    let fixture = FixtureBuild {binary:build.join("bend-phase4"),source:build.join("instrumented.c"),archive,legacy:build.join("legacy-close"),peer:build.join("uws-peer"),sanitizer:build.join("bend-phase4-sanitized")};
+    let mut artifacts = vec![fixture.binary.clone(),fixture.source.clone(),fixture.legacy.clone(),fixture.peer.clone()];
+    if full {artifacts.push(fixture.sanitizer.clone());}
+    let complete = build.join("complete.json");
+    let reused = artifacts.iter().all(|p|p.is_file()) && fs::read(&complete).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok()).is_some_and(|v|v["identity"]==identity && v["artifacts"]==fixture_checksums(&artifacts));
+    fs::write(out.join("fixture-build.json"),serde_json::to_vec_pretty(&json!({"key":key,"directory":build,"cache_hit":reused,"identity":identity})).unwrap()).unwrap();
+    println!("Phase 4 fixture cache {}: {key}",if reused {"hit"} else {"miss"});
+    if reused {return fixture;}
+    if complete.exists() {fs::remove_file(&complete).unwrap();}
+    let mut c = Command::new(&bend); c.arg("version");
+    assert_eq!(run(c,root,&build,"bend-version").trim(),"bend 2.0.40");
+    let original = build.join("original.c");
+    let mut c = Command::new(&bend); c.arg("bench/ws/bend-phase4.bend").arg("-o").arg(&original);
+    run(c,root,&build,"emit");
+    let source = instrument(fs::read_to_string(original).unwrap());
+    fs::write(&fixture.source,&source).unwrap();
+    let mut legacy = source;
+    replace(&mut legacy,"  if (code == WS_PENDING) return io_wait_on(w, 0, 0, io_tick()+100000ull, ws_stop_more);","  if (code == WS_PENDING && io_tick() < (u64)w->made) return io_wait_on(w, 0, 0, io_tick()+100000ull, ws_stop_more);\n  if (code == WS_PENDING) return WS_FAILED;");
+    let legacy_source = build.join("legacy-close.c"); fs::write(&legacy_source,legacy).unwrap();
+    for (label,source,binary,flags) in [("bend",&fixture.source,&fixture.binary,vec!["-O2","-g"]),("legacy",&legacy_source,&fixture.legacy,vec!["-O2"]),("sanitizer",&fixture.source,&fixture.sanitizer,vec!["-O0","-g","-fsanitize=address,undefined","-fno-omit-frame-pointer"])] {
+        if label=="sanitizer" && !full {continue;}
+        let mut c = Command::new(&clang);
+        c.args(flags).args(["-std=c11","-DBEND_POISON"]).arg("-I").arg(root.join("src/ws/native")).arg("-I").arg(root.join("src/bytes")).arg(source).arg(&fixture.archive).args(["-lpthread","-lm","-ldl"]).arg("-o").arg(binary);
+        run(c,root,&build,&format!("build-{label}"));
+        assert!(fs::read(binary).unwrap().starts_with(b"\x7fELF"));
+    }
+    assert_eq!(build_peer(root,&build,cache,&clang),fixture.peer);
+    assert_eq!(identity["inputs"],fixture_checksums(&files));
+    fs::write(build.join("complete.tmp"),serde_json::to_vec_pretty(&json!({"identity":identity,"artifacts":fixture_checksums(&artifacts)})).unwrap()).unwrap();
+    fs::rename(build.join("complete.tmp"),complete).unwrap();
+    fixture
+}
+
+#[test]
+#[ignore = "fixture build/cache probe without actor trials"]
+fn phase4_fixture_build_probe() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap();
+    let cache = env::var_os("WS_CACHE").map(PathBuf::from).unwrap_or_else(||root.join(".ws-cache"));
+    let out = root.join(format!("results/ws/phase4-build-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&out).unwrap();
+    fixture_build(&root,&cache,&out,false);
+}
+
 #[test]
 fn phase4_real_bend() {
     qualify(QualificationProfile::Routine);
@@ -949,74 +1047,14 @@ fn qualify(profile: QualificationProfile) {
         .unwrap(),
     )
     .unwrap();
-    let bend = cache.join("bend/bin/bend");
-    let clang = PathBuf::from("/usr/lib/llvm-19/bin/clang");
-    let mut c = Command::new(&bend);
-    c.arg("version");
-    assert_eq!(run(c, &root, &out, "bend-version").trim(), "bend 2.0.40");
-    let original = out.join("original.c");
-    let mut c = Command::new(&bend);
-    c.arg("bench/ws/bend-phase4.bend").arg("-o").arg(&original);
-    run(c, &root, &out, "emit");
-    let source = out.join("instrumented.c");
-    fs::write(&source, instrument(fs::read_to_string(&original).unwrap())).unwrap();
-    let deps = env::current_exe().unwrap().parent().unwrap().to_owned();
+    let FixtureBuild {binary, archive, legacy:legacy_binary, peer, sanitizer, ..} = fixture_build(&root,&cache,&out,full);
     let marker = confluxion_ws_native::build_marker();
-    let mut archives: Vec<_> = fs::read_dir(deps)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| {
-            p.extension().is_some_and(|x| x == "a")
-                && p.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("libconfluxion_ws_native-")
-        })
-        .filter(|p| {
-            fs::read(p)
-                .unwrap()
-                .windows(marker.len())
-                .any(|b| b == marker.as_bytes())
-        })
-        .collect();
-    archives.sort();
-    assert!(!archives.is_empty(), "missing current native build archive");
-    let binary = out.join("bend-phase4");
-    let mut c = Command::new(&clang);
-    c.args(["-O2", "-g", "-std=c11", "-DBEND_POISON"])
-        .arg("-I")
-        .arg(root.join("src/ws/native"))
-        .arg(&source)
-        .arg(&archives[0])
-        .args(["-lpthread", "-lm", "-ldl"])
-        .arg("-o")
-        .arg(&binary);
-    run(c, &root, &out, "build-bend");
-    assert!(fs::read(&binary).unwrap().starts_with(b"\x7fELF"));
-    let legacy_source = out.join("legacy-close.c");
-    let mut legacy = fs::read_to_string(&source).unwrap();
-    replace(&mut legacy,
-        "  if (code == WS_PENDING) return io_wait_on(w, 0, 0, io_tick()+100000ull, ws_stop_more);",
-        "  if (code == WS_PENDING && io_tick() < (u64)w->made) return io_wait_on(w, 0, 0, io_tick()+100000ull, ws_stop_more);\n  if (code == WS_PENDING) return WS_FAILED;");
-    fs::write(&legacy_source, legacy).unwrap();
-    let legacy_binary = out.join("legacy-close");
-    let mut c = Command::new(&clang);
-    c.args(["-O2", "-std=c11", "-DBEND_POISON"])
-        .arg("-I")
-        .arg(root.join("src/ws/native"))
-        .arg(&legacy_source)
-        .arg(&archives[0])
-        .args(["-lpthread", "-lm", "-ldl"])
-        .arg("-o")
-        .arg(&legacy_binary);
-    run(c, &root, &out, "build-legacy-close");
     let mut legacy_close =
         adverse_lifecycle(&legacy_binary, &root, &out, "legacy-close-control", false);
     legacy_close["mode"] = json!("legacy-close");
     let mut adverse = adverse_lifecycle(&binary, &root, &out, "adverse-lifecycle", true);
     adverse["mode"] = json!("ownership");
     let mut adverse_cases = vec![adverse];
-    let peer = build_peer(&root, &out, &cache, &clang);
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     drop(l);
@@ -1181,24 +1219,6 @@ fn qualify(profile: QualificationProfile) {
         config.lifecycle_cycles,
     )];
     if full {
-        let sanitizer = out.join("bend-phase4-sanitized");
-        let mut c = Command::new(&clang);
-        c.args([
-            "-O0",
-            "-g",
-            "-std=c11",
-            "-DBEND_POISON",
-            "-fsanitize=address,undefined",
-            "-fno-omit-frame-pointer",
-        ])
-        .arg("-I")
-        .arg(root.join("src/ws/native"))
-        .arg(&source)
-        .arg(&archives[0])
-        .args(["-lpthread", "-lm", "-ldl"])
-        .arg("-o")
-        .arg(&sanitizer);
-        run(c, &root, &out, "build-sanitizer");
         for index in 6..21 {
             finite_cases.push(finite(&sanitizer, &root, &out, index, "asan-ubsan"));
         }
@@ -1220,5 +1240,5 @@ fn qualify(profile: QualificationProfile) {
         .collect();
     let startup_faults = startup_faults(&binary, &root, &out);
     let omitted = omitted_release(&binary, &root, &out);
-    fs::write(out.join("summary.json"),serde_json::to_vec_pretty(&json!({"pass":true,"scope":config.scope,"configured":configured,"transfer":transfer,"compute_attempts":attempts,"peer":peer,"archive":archives[0],"marker":marker,"finite":finite_cases,"lifecycle":lifecycle_cases,"adverse_lifecycle":adverse_cases,"legacy_close_control":legacy_close,"integrity":integrity_cases,"damaged_compute_controls":5,"startup_faults":startup_faults,"omitted_release":omitted})).unwrap()).unwrap();
+    fs::write(out.join("summary.json"),serde_json::to_vec_pretty(&json!({"pass":true,"scope":config.scope,"configured":configured,"transfer":transfer,"compute_attempts":attempts,"peer":peer,"archive":archive,"marker":marker,"finite":finite_cases,"lifecycle":lifecycle_cases,"adverse_lifecycle":adverse_cases,"legacy_close_control":legacy_close,"integrity":integrity_cases,"damaged_compute_controls":5,"startup_faults":startup_faults,"omitted_release":omitted})).unwrap()).unwrap();
 }

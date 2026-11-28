@@ -7,6 +7,7 @@ edition = "2021"
 tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 serde_json = "=1.0.145"
 libc = "=0.2.177"
+bend-codec = { path = "../../../tools/bend-codec", optional = true }
 
 confluxion-ws-native = { path = "../../../src/ws/native", optional = true }
 rand = { version = "=0.9.5", optional = true }
@@ -19,7 +20,7 @@ phase1 = ["dep:confluxion-ws-native"]
 phase2 = ["dep:confluxion-ws-native", "dep:rand", "dep:rand_chacha"]
 phase3 = ["dep:confluxion-ws-native"]
 phase4 = ["dep:confluxion-ws-native"]
-phase5 = ["dep:confluxion-ws-native"]
+phase5 = ["dep:confluxion-ws-native", "dep:bend-codec"]
 
 [[bin]]
 name = "ws-reference"

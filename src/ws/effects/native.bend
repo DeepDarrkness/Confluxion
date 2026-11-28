@@ -4,24 +4,28 @@ type Start is Type:
   Started{session: File, closer: File}
   StartFailed{code: U32}
 type Admission is Type:
-  Accepted{}
-  Full{bytes: List<U32>}
-  Rejected{code: U32, bytes: List<U32>}
+  Accepted{words: Array<U32>, length: U32}
+  Full{words: Array<U32>, length: U32}
+  Rejected{code: U32, words: Array<U32>, length: U32}
+type Batch is Type:
+  BatchNil{}
+  BatchCon{words: Array<U32>, length: U32, rest: Batch}
 type BatchAdmission is Type:
-  BatchAccepted{count: U32}
-  BatchFull{messages: List<List<U32>>}
-  BatchRejected{code: U32, messages: List<List<U32>>}
-type Message is Type:
-  Message{kind: U32, bytes: List<U32>}
+  BatchAccepted{count: U32, messages: Batch}
+  BatchFull{messages: Batch}
+  BatchRejected{code: U32, messages: Batch}
+type Metadata is Type:
+  MetadataNil{}
+  MetadataCon{kind: U32, index: U32, length: U32, rest: Metadata}
 type Receive is Type:
   Empty{}
   End{reason: U32}
-  Payload{lease: File, message: Message}
+  Payload{lease: File, kind: U32, index: U32, length: U32}
   ReceiveFailed{code: U32}
 type BatchReceive is Type:
   BatchEmpty{}
   BatchEnd{reason: U32}
-  Messages{lease: File, messages: List<Message>}
+  Messages{lease: File, messages: Metadata}
   BatchReceiveFailed{code: U32}
 type Counter is Data:
   Counter{hi: U32, lo: U32}
@@ -35,10 +39,10 @@ type Status is Data:
 def connect(host: String, port: U32, target: String, protocol: String) -> IO(Start):
   import "./native.c"
   import "./native.js"
-def offer(session: File, bytes: List<U32>) -> IO(File & Admission):
+def offer(session: File, words: Array<U32>, length: U32) -> IO(File & Admission):
   import "./native.c"
   import "./native.js"
-def offer_batch(session: File, messages: List<List<U32>>) -> IO(File & BatchAdmission):
+def offer_batch(session: File, messages: Batch) -> IO(File & BatchAdmission):
   import "./native.c"
   import "./native.js"
 def take(session: File, wait_ms: U32) -> IO(File & Receive):

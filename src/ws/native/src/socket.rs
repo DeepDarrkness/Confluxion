@@ -47,6 +47,31 @@ pub struct BatchAdmission {
     accepted: u32,
 }
 #[repr(C)]
+pub struct Buffer {
+    bytes: *const u8,
+    len: u32,
+    kind: u32,
+}
+#[repr(C)]
+pub struct ByteView {
+    bytes: *const u8,
+    code: u32,
+    len: u32,
+    kind: u32,
+    reserved: u32,
+}
+impl ByteView {
+    fn error(code: u32) -> Self {
+        Self {
+            bytes: std::ptr::null(),
+            code,
+            len: 0,
+            kind: 0,
+            reserved: 0,
+        }
+    }
+}
+#[repr(C)]
 pub struct BatchTake {
     lease: u64,
     code: u32,
@@ -387,6 +412,94 @@ pub extern "C" fn ws_socket_connect_wait(h: u64) -> Wait {
         },
     )
 }
+fn message_kind(kind: u32, bytes: &[u8]) -> Result<Kind, u32> {
+    match kind {
+        0 => Ok(Kind::Binary),
+        1 => {
+            std::str::from_utf8(bytes).map_err(|_| 20u32)?;
+            Ok(Kind::Text)
+        }
+        _ => Err(INVALID),
+    }
+}
+fn admit(h: u64, messages: &[(Kind, &[u8])]) -> Result<(), u32> {
+    let s = session(h, 1)?;
+    match s.client.offer_batch(messages).map_err(error)? {
+        protocol::Admission::Accepted => Ok(()),
+        protocol::Admission::Rejected(protocol::Rejection::Busy) => Err(FULL),
+        protocol::Admission::Rejected(protocol::Rejection::Oversize) => Err(OVERSIZE),
+        _ => Err(END),
+    }
+}
+fn admission(result: Result<(), u32>, count: u32) -> BatchAdmission {
+    match result {
+        Ok(()) => BatchAdmission {
+            code: OK,
+            accepted: count,
+        },
+        Err(code) => BatchAdmission { code, accepted: 0 },
+    }
+}
+unsafe fn offer_buffers(h: u64, p: *const Buffer, count: u32, limit: u32) -> BatchAdmission {
+    let result = (|| {
+        if count > 128 {
+            return Err(OVERSIZE);
+        }
+        if count != 0 && p.is_null() {
+            return Err(INVALID);
+        }
+        let buffers = if count == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(p, count as usize)
+        };
+        let mut messages = [(Kind::Binary, &[][..]); 128];
+        let mut total = 0u32;
+        for (i, buffer) in buffers.iter().enumerate() {
+            total = total.checked_add(buffer.len).ok_or(OVERSIZE)?;
+            if total > limit {
+                return Err(OVERSIZE);
+            }
+            let b = bytes(buffer.bytes, buffer.len)?;
+            messages[i] = (message_kind(buffer.kind, b)?, b);
+        }
+        admit(h, &messages[..count as usize])
+    })();
+    admission(result, count)
+}
+#[no_mangle]
+pub unsafe extern "C" fn ws_socket_offer_buffer(
+    h: u64,
+    data: *const u8,
+    len: u32,
+) -> BatchAdmission {
+    contain(
+        || admission(Err(PANIC), 0),
+        || {
+            offer_buffers(
+                h,
+                &Buffer {
+                    bytes: data,
+                    len,
+                    kind: 0,
+                },
+                1,
+                1048576,
+            )
+        },
+    )
+}
+#[no_mangle]
+pub unsafe extern "C" fn ws_socket_offer_buffers(
+    h: u64,
+    p: *const Buffer,
+    count: u32,
+) -> BatchAdmission {
+    contain(
+        || admission(Err(PANIC), 0),
+        || offer_buffers(h, p, count, 65536),
+    )
+}
 #[no_mangle]
 pub unsafe extern "C" fn ws_socket_offer_batch(
     h: u64,
@@ -426,40 +539,14 @@ pub unsafe extern "C" fn ws_socket_offer_batch(
                     }
                     let b = &data[offset..end];
                     offset = end;
-                    messages[i] = (
-                        match span.kind {
-                            0 => Kind::Binary,
-                            1 => {
-                                std::str::from_utf8(b).map_err(|_| 20u32)?;
-                                Kind::Text
-                            }
-                            _ => return Err(INVALID),
-                        },
-                        b,
-                    );
+                    messages[i] = (message_kind(span.kind, b)?, b);
                 }
                 if offset != data.len() {
                     return Err(INVALID);
                 }
-                let s = session(h, 1)?;
-                match s
-                    .client
-                    .offer_batch(&messages[..count as usize])
-                    .map_err(error)?
-                {
-                    protocol::Admission::Accepted => Ok(()),
-                    protocol::Admission::Rejected(protocol::Rejection::Busy) => Err(FULL),
-                    protocol::Admission::Rejected(protocol::Rejection::Oversize) => Err(OVERSIZE),
-                    _ => Err(END),
-                }
+                admit(h, &messages[..count as usize])
             })();
-            match result {
-                Ok(()) => BatchAdmission {
-                    code: OK,
-                    accepted: count,
-                },
-                Err(code) => BatchAdmission { code, accepted: 0 },
-            }
+            admission(result, count)
         },
     )
 }
@@ -530,6 +617,37 @@ pub extern "C" fn ws_socket_take_batch(h: u64, count: u32, bytes: u32) -> BatchT
                     value
                 }
             }
+        },
+    )
+}
+#[no_mangle]
+pub extern "C" fn ws_socket_lease_view(h: u64, message: u32) -> ByteView {
+    contain(
+        || ByteView::error(PANIC),
+        || {
+            let r = lock(&SOCKETS);
+            let result = (|| {
+                let i = lookup(&r, h)?;
+                let lease = match &r[i].entry {
+                    Entry::Lease(lease) => lease,
+                    _ => return Err(ROLE),
+                };
+                let span = lease.spans.get(message as usize).ok_or(INVALID)?;
+                let start = span.offset as usize;
+                let end = start.checked_add(span.len as usize).ok_or(INVALID)?;
+                let data = lease.bytes.get(start..end).ok_or(INVALID)?;
+                if span.reserved != 0 || span.kind > 1 {
+                    return Err(INVALID);
+                }
+                Ok(ByteView {
+                    bytes: data.as_ptr(),
+                    code: OK,
+                    len: span.len,
+                    kind: span.kind,
+                    reserved: 0,
+                })
+            })();
+            result.unwrap_or_else(ByteView::error)
         },
     )
 }
@@ -752,6 +870,8 @@ pub unsafe extern "C" fn ws_socket_fixture_evidence(h: u64, values: *mut u64, co
 }
 const _: () = {
     assert!(std::mem::size_of::<Span>() == 16);
+    assert!(std::mem::size_of::<Buffer>() == 16);
+    assert!(std::mem::size_of::<ByteView>() == 24);
     assert!(std::mem::size_of::<BatchTake>() == 40);
     assert!(std::mem::size_of::<Status>() == 144);
 };
